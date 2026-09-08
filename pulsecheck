@@ -719,7 +719,7 @@ $1 == "TICK" { frame(); next }
 # the display is still on screen at this point and the shell prints it after the
 # cursor and scroll region have been restored. The verdict goes to a second file
 # so the exit status does not have to survive the fifo and the wait.
-function writesummary(   i, rp50, rp95, mean, dur, rate, v, line) {
+function writesummary(   rp50, rp95, mean, dur, v, txt) {
   if (!rundir) return
   v = 0
   mean = runok ? runsum/runok : 0
@@ -730,22 +730,22 @@ function writesummary(   i, rp50, rp95, mean, dur, rate, v, line) {
     rp95 = (rn >= 20) ? pct(res, rn, 0.95) : -1
   }
   if (summary) {
-    line = sprintf("\npulsecheck summary\n")
-    line = line sprintf("  target     %s  (%s)\n", url, mode)
-    line = line sprintf("  requests   %d in %s", runtot, span_s(dur))
-    if (dur > 0 && runtot > 1) line = line sprintf("  (one every %.2fs)", dur/(runtot-1))
-    line = line "\n"
-    line = line sprintf("  outcome    %d ok, %d failed, %.1f%% error\n", runok, runerr, \
+    txt = sprintf("\npulsecheck summary\n")
+    txt = txt sprintf("  target     %s  (%s)\n", url, mode)
+    txt = txt sprintf("  requests   %d in %s", runtot, span_s(dur))
+    if (dur > 0 && runtot > 1) txt = txt sprintf("  (one every %.2fs)", dur/(runtot-1))
+    txt = txt "\n"
+    txt = txt sprintf("  outcome    %d ok, %d failed, %.1f%% error\n", runok, runerr, \
                         runtot ? 100*runerr/runtot : 0)
     if (runok > 0) {
-      line = line sprintf("  latency    min %s  mean %s  p50 %s  p95 %s  max %s\n", \
+      txt = txt sprintf("  latency    min %s  mean %s  p50 %s  p95 %s  max %s\n", \
                           fmt(runmin), fmt(mean), fmt(rp50), \
                           (rp95 < 0 ? "—" : fmt(rp95)), fmt(runmax))
-      line = line sprintf("             over %d successful request%s%s\n", runok, \
+      txt = txt sprintf("             over %d successful request%s%s\n", runok, \
                           (runok == 1 ? "" : "s"), \
                           (runok > RCAP ? sprintf(", percentiles from a %d-sample reservoir", RCAP) : ""))
     } else {
-      line = line "  latency    no successful request to measure\n"
+      txt = txt "  latency    no successful request to measure\n"
     }
   }
   # Thresholds are judged on the run, not on the last window: a CI gate asking
@@ -753,21 +753,21 @@ function writesummary(   i, rp50, rp95, mean, dur, rate, v, line) {
   # happened to be in the buffer at the moment the run stopped.
   if (failover != "") {
     if (runok == 0 || rp95 < 0) {
-      if (summary) line = line sprintf("  p95 gate   —  (needs 20 successful requests, saw %d)\n", runok)
+      if (summary) txt = txt sprintf("  p95 gate   —  (needs 20 successful requests, saw %d)\n", runok)
       v = 1
     } else {
-      if (summary) line = line sprintf("  p95 gate   %s vs %sms  %s\n", fmt(rp95), failover, \
+      if (summary) txt = txt sprintf("  p95 gate   %s vs %sms  %s\n", fmt(rp95), failover, \
                                        (rp95 > failover+0) ? "FAIL" : "ok")
       if (rp95 > failover+0) v = 1
     }
   }
   if (failerr != "") {
     erpct = runtot ? 100*runerr/runtot : 0
-    if (summary) line = line sprintf("  err gate   %.1f%% vs %s%%  %s\n", erpct, failerr, \
+    if (summary) txt = txt sprintf("  err gate   %.1f%% vs %s%%  %s\n", erpct, failerr, \
                                      (erpct > failerr+0) ? "FAIL" : "ok")
     if (erpct > failerr+0) v = 1
   }
-  if (summary) printf "%s", line > (rundir "/summary")
+  if (summary) printf "%s", txt > (rundir "/summary")
   printf "%d\n", v > (rundir "/verdict")
   close(rundir "/summary")
   close(rundir "/verdict")
