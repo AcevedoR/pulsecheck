@@ -29,8 +29,10 @@ SUMMARY=0
 COUNT=0        # 0 = run until interrupted
 FAILOVER=      # --fail-over: p95 ceiling, milliseconds
 FAILERR=       # --fail-err: error-rate ceiling, percent
-HDRS=          # accumulated curl config lines, one per --header
+CURLRC=        # accumulated curl config lines: headers, resolve, head, insecure
 HDRN=0
+METH=GET
+INSEC=0
 FRAME=0.1      # animation tick, seconds (10fps) — only when the wave is on
 HDR=5          # header lines held above the scroll region (6 with the wave)
 
@@ -47,6 +49,9 @@ Options:
   -t, --timeout S    per-request timeout, in seconds (default: 5)
   -e, --expect CODE  HTTP status treated as success (default: 200)
   -H, --header H     request header, repeatable ("Name: value")
+      --head         probe with HEAD instead of GET
+      --insecure     do not verify the TLS certificate
+      --resolve SPEC pin a host to an address, repeatable (HOST:PORT:ADDR)
   -p, --plain        one self-contained line per sample, no fixed header
       --json         one JSON object per sample on stdout
   -c, --count N      stop after N samples (default: run until interrupted)
@@ -125,7 +130,7 @@ while [ $# -gt 0 ]; do
       # second pass would double-escape what the first one added.
       _h=${2//\\/\\\\}
       _h=${_h//\"/\\\"}
-      HDRS="${HDRS}header = \"${_h}\"
+      CURLRC="${CURLRC}header = \"${_h}\"
 "
       HDRN=$(( HDRN + 1 ))
       shift 2 ;;
@@ -136,6 +141,29 @@ while [ $# -gt 0 ]; do
     -c|--count)    [ $# -ge 2 ] || die "$1 needs a value"; COUNT=$2; shift 2 ;;
     --fail-over)   [ $# -ge 2 ] || die "$1 needs a value"; FAILOVER=$2; shift 2 ;;
     --fail-err)    [ $# -ge 2 ] || die "$1 needs a value"; FAILERR=$2; shift 2 ;;
+    --head)
+      # curl config uses the long option name without its leading dashes.
+      CURLRC="${CURLRC}head
+"
+      METH=HEAD; shift ;;
+    --insecure)
+      CURLRC="${CURLRC}insecure
+"
+      INSEC=1; shift ;;
+    --resolve)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      # HOST:PORT:ADDRESS, with curl also accepting a leading + or -. Two colons
+      # is the cheapest check that separates a real spec from a typo, and a typo
+      # here would otherwise resolve nothing and look like a network fault.
+      case $2 in
+        *:*:*) ;;
+        *) die "--resolve needs HOST:PORT:ADDRESS (got: $2)" ;;
+      esac
+      _r=${2//\\/\\\\}
+      _r=${_r//\"/\\\"}
+      CURLRC="${CURLRC}resolve = \"${_r}\"
+"
+      shift 2 ;;
     --fresh)       FRESH=1; shift ;;
     --color)       [ $# -ge 2 ] || die "$1 needs a value"; WHEN=$2; shift 2 ;;
     --diag)        DIAG=1; shift ;;
@@ -356,7 +384,7 @@ mkfifo "$RUNDIR/stream" || die "cannot create a pipe in $RUNDIR"
 # and nothing here can change it — verified, both ways. curl -H @file is the
 # form that keeps a token out of process listings altogether, and it is passed
 # straight through.
-printf '%s' "$HDRS" > "$RUNDIR/headers" || die "cannot write $RUNDIR/headers"
+printf '%s' "$CURLRC" > "$RUNDIR/curlrc" || die "cannot write $RUNDIR/curlrc"
 if [ "$MODE" = reuse ]; then
   mkfifo "$RUNDIR/w" || die "cannot create a pipe in $RUNDIR"
   # Paired url/output entries, written once and reused for every batch. A bare
@@ -517,9 +545,11 @@ BEGIN {
   if (SHF < 4) SHF = 4; if (SHF > 40) SHF = 40
   DASH="—"
   rule=""; for (i=0;i<cols-1;i++) rule=rule "─"
-  urlw = cols - 14                                # room for "pulsecheck X.Y.Z "
-  if (urlw < 20) urlw = 20
-  shorturl = (length(url) > urlw) ? substr(url,1,urlw-1) "…" : url
+  # The URL is clipped at render time, not here: it shares row 1 with a suffix
+  # that grows at runtime (a degraded connection mode adds "· server closes")
+  # and with whatever --head and --insecure add. Clipping against a fixed width
+  # computed once would let a long URL push that suffix off the edge, or wrap
+  # the row and scroll the list.
   header()
 }
 # Tuned for an HTTP endpoint over a network: 53ms is a healthy API, not a
@@ -663,8 +693,21 @@ function header(   l1,l2,l3,l4,ec) {
   # happening rather than what was requested.
   modetxt = mode
   if (mode == "reuse" && m >= 4 && recon > m/2) modetxt = "reuse · server closes"
-  l1 = sprintf("%spulsecheck%s %s%s%s %s %s· %s%s%s", B, R, D, ver, R, shorturl, \
-               D, modetxt, modenote, R)
+  # Everything on this row that qualifies the numbers below it: how the
+  # connection is being made, what verb is being sent, and whether the
+  # certificate is being checked. Two strings are built in step — one plain, to
+  # measure, one coloured, to print — because the escape codes would otherwise
+  # count towards the width.
+  sfxp = modetxt modenote
+  sfxc = D modetxt modenote R
+  if (meth != "GET") { sfxp = sfxp " · " meth;      sfxc = sfxc D " · " R B meth R }
+  # Yellow, not dim: not verifying the certificate is a fact about the
+  # measurement that should be visible at a glance, not tucked away.
+  if (insec)         { sfxp = sfxp " · insecure";   sfxc = sfxc D " · " R YEL "insecure" R }
+  avail = cols - 11 - length(ver) - length(sfxp) - 6
+  if (avail < 20) avail = 20
+  su = (length(url) > avail) ? substr(url,1,avail-1) "…" : url
+  l1 = sprintf("%spulsecheck%s %s%s%s %s %s·%s %s", B, R, D, ver, R, su, D, R, sfxc)
   # "window 60 samples" is the clause that implies a duration without stating
   # one, so the real span replaces its tail rather than being appended as a new
   # clause elsewhere. Yellow only when the measured cadence has slipped past
@@ -903,7 +946,7 @@ PIPE=$!
       # delivers a whole batch at exit, which would freeze the display and then
       # dump it. stderr is unbuffered and streams line by line. -N does not
       # help, and a bare %stderr form prints literally.
-      curl -s -K "$RUNDIR/headers" -K "$RUNDIR/urls" --rate "${RATE}/d" -m "$TMO" \
+      curl -s -K "$RUNDIR/curlrc" -K "$RUNDIR/urls" --rate "${RATE}/d" -m "$TMO" \
         -w '%{stderr}%{http_code} %{time_total} %{num_connects}\n' \
         2>"$RUNDIR/w" >/dev/null &
       echo $! > "$RUNDIR/curl.pid"
@@ -941,7 +984,7 @@ PIPE=$!
   else
     while :; do
       stamp
-      OUT=$(curl -s -K "$RUNDIR/headers" -o /dev/null -m "$TMO" \
+      OUT=$(curl -s -K "$RUNDIR/curlrc" -o /dev/null -m "$TMO" \
             -w '%{http_code} %{time_total}' "$URL")
       # 6 fractional digits, not 9: an IEEE double holds about 16 significant
       # digits, so the last three would be lost silently. Truncating is plainer.

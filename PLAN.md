@@ -485,7 +485,14 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
   process argv at all; inline it appears in two. So `@file` is documented as the
   way to watch an authenticated endpoint without leaking to process listings,
   and the display only ever shows a count (`· 2 headers`), never a name or a
-  value. Still open from this bullet: `--head`, `--insecure`, `--resolve`.
+  value. ~~Still open from this bullet: `--head`, `--insecure`, `--resolve`~~ — **also
+  done**, passed through the same config file, each verified against a real
+  server rather than by checking the flag was written down: HEAD is asserted by
+  a server that records the methods it saw, `--resolve` by pinning a
+  `.invalid` host that can never resolve, and `--insecure` against a generated
+  self-signed certificate. `--head` measures a different thing from a GET and
+  the README says so; `--insecure` is rendered in yellow on the header, since
+  not verifying a certificate qualifies every number underneath it.
 - ~~Portability and CI~~ **IN PROGRESS.** A suite exists (`tests/`, 127
   assertions across cli, awk, locale, screen and e2e) and CI runs it on
   ubuntu-latest and macos-latest across mawk, gawk and BWK awk, with a
