@@ -493,12 +493,24 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
 - Multiple URLs in one process.
 
 **v0.4 — distribution**
-- Homebrew tap and a one-line install script. `pulsecheck` is free on brew,
-  crates.io and npm.
+- ~~A one-line install script~~ **DONE.** `install.sh`, POSIX sh because it runs
+  before the bash the tool needs is known to be there, and it verifies what it
+  downloaded is the script — shebang, version line, `bash -n` — before putting
+  it on a PATH. A proxy error page installed as a program is a worse outcome
+  than a failed install.
+- ~~Homebrew~~ **PARTLY.** `Formula/pulsecheck.rb` is HEAD-only and installable
+  by URL; a stable `url`/`sha256` block wants a tagged release, and
+  `brew install AcevedoR/pulsecheck/pulsecheck` wants a second repository named
+  `homebrew-pulsecheck`. Both are decisions rather than work.
 - A man page.
-- **An asciinema GIF at the top of the README.** For a terminal tool this is the
-  actual adoption driver: nobody installs a live monitor they have not seen move.
-  The rolling window is the differentiator and it is invisible in static text.
+- ~~A moving demo at the top of the README~~ **DONE**, though not with
+  asciinema. `tools/svgcast.py` replays a `--record` capture into an animated
+  SVG: the capture format was already ours, and asciinema plus agg would have
+  been two dependencies for anyone regenerating it. One shared CSS keyframe with
+  a per-frame negative delay rather than one keyframe block per frame, which is
+  what brings a 20-second, 72-frame demo down to something a README can carry.
+  It has its own small terminal model, separate from the one in `tests/`,
+  because that one deliberately ignores colour and a demo cannot.
 
 **v1.0 — the frozen CLI surface**
 
