@@ -150,6 +150,28 @@ tests/replay.py /tmp/p.raw 59 200      # render that stream back into a grid
 A recording plus the geometry from `--diag` (the DSR reply, `stty size`, `tput`,
 and which it chose) reproduces what a terminal showed without having it.
 
+## Tests
+
+```sh
+tests/run.sh                # everything
+tests/run.sh cli awk        # one or more suites by name
+```
+
+Four suites, no framework and nothing to install — the same bash, awk, curl and
+python3 the tool itself already needs:
+
+| suite | what it covers |
+| --- | --- |
+| `cli` | the command-line contract: exit codes and messages for every bad flag, and `to_ms()` |
+| `awk` | the pure functions inside the awk program — `pct`, `wscale`, `wlevel`, `col`, `fmt` |
+| `screen` | the ANSI screen model in `tests/screen.py` that the display assertions are built on |
+| `e2e` | a plain-mode run against a throwaway local HTTP server: sample lines, `--expect`, a dead port |
+
+The awk suite lifts each function out of the script with `tests/extract.awk` and
+calls it from a driver, so the scale and percentile logic can be checked without
+a terminal, a network or a clock in the loop. CI runs all four on Linux and
+macOS, since bash 3.2 and BWK awk are where portability actually gets decided.
+
 ## License
 
 MIT
