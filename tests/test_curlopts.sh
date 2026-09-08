@@ -37,10 +37,10 @@ command -v python3 >/dev/null || { echo "python3 not found; skipping the rest" >
 probe() {
   local out=$TMP/out
   : > "$out"
-  ( $PC -p -i 0.05 -t 2 "$@" >"$out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
+  ( $PC -p -i 0.1 -t 2 "$@" >"$out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
   local pid; pid=$(cat "$TMP/pid")
   local i=0
-  while [ "$(wc -l < "$out")" -lt 3 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
+  while [ "$(wc -l < "$out")" -lt 3 ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
   cat "$out"
 }
@@ -90,7 +90,7 @@ else
   else
     python3 - "$TMP" <<'PY' &
 import ssl, sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 tmp = sys.argv[1]
 class H(BaseHTTPRequestHandler):
     protocol_version = 'HTTP/1.1'
@@ -100,7 +100,11 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b'ok')
     def log_message(self, *a): pass
-srv = HTTPServer(('127.0.0.1', 0), H)
+# Threaded for the same reason tests/serve.py is: the first probe here fails
+# TLS on every request, and a single-threaded server can stall under that,
+# leaving the next probe with no response at all.
+srv = ThreadingHTTPServer(('127.0.0.1', 0), H)
+srv.daemon_threads = True
 ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
 ctx.load_cert_chain(tmp + '/c.pem', tmp + '/k.pem')
 srv.socket = ctx.wrap_socket(srv.socket, server_side=True)
