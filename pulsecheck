@@ -24,6 +24,11 @@ DIAG=0
 RECORD=
 FRESH=0
 WHEN=auto      # --color: auto, always or never
+JSON=0
+SUMMARY=0
+COUNT=0        # 0 = run until interrupted
+FAILOVER=      # --fail-over: p95 ceiling, milliseconds
+FAILERR=       # --fail-err: error-rate ceiling, percent
 HDRS=          # accumulated curl config lines, one per --header
 HDRN=0
 FRAME=0.1      # animation tick, seconds (10fps) — only when the wave is on
@@ -43,6 +48,11 @@ Options:
   -e, --expect CODE  HTTP status treated as success (default: 200)
   -H, --header H     request header, repeatable ("Name: value")
   -p, --plain        one self-contained line per sample, no fixed header
+      --json         one JSON object per sample on stdout
+  -c, --count N      stop after N samples (default: run until interrupted)
+      --summary      print totals for the whole run when it stops
+      --fail-over MS exit 1 if the run p95 exceeds MS
+      --fail-err PCT exit 1 if the run error rate exceeds PCT
       --fresh        a new connection per request (default: reuse one)
       --color WHEN   auto, always or never (default: auto; NO_COLOR honoured)
       --no-wave      drop the animated heartbeat trace from the header
@@ -121,6 +131,11 @@ while [ $# -gt 0 ]; do
       shift 2 ;;
     -p|--plain)    PLAIN=1; shift ;;
     --no-wave)     WAVE=0; shift ;;
+    --json)        JSON=1; shift ;;
+    --summary)     SUMMARY=1; shift ;;
+    -c|--count)    [ $# -ge 2 ] || die "$1 needs a value"; COUNT=$2; shift 2 ;;
+    --fail-over)   [ $# -ge 2 ] || die "$1 needs a value"; FAILOVER=$2; shift 2 ;;
+    --fail-err)    [ $# -ge 2 ] || die "$1 needs a value"; FAILERR=$2; shift 2 ;;
     --fresh)       FRESH=1; shift ;;
     --color)       [ $# -ge 2 ] || die "$1 needs a value"; WHEN=$2; shift 2 ;;
     --diag)        DIAG=1; shift ;;
@@ -184,6 +199,24 @@ esac
 case $EXPECT in
   ''|*[!0-9]*) die "--expect must be a 3-digit HTTP status (or 000)" ;;
 esac
+case $COUNT in
+  ''|*[!0-9]*) die "--count must be a whole number of samples" ;;
+esac
+[ -z "$FAILOVER" ] || case $FAILOVER in
+  *[!0-9.]*|*.*.*|'') die "--fail-over must be a number of milliseconds" ;;
+esac
+[ -z "$FAILERR" ] || case $FAILERR in
+  *[!0-9.]*|*.*.*|'') die "--fail-err must be a percentage" ;;
+esac
+# A threshold with nothing to stop the run can never be evaluated: the process
+# would sit there forever holding a verdict it never gets to deliver. Saying so
+# is better than exiting 0 at the end of a run that never ends.
+if [ "$COUNT" = 0 ] && { [ -n "$FAILOVER" ] || [ -n "$FAILERR" ]; }; then
+  die "--fail-over and --fail-err need --count, or the run never reaches a verdict"
+fi
+# JSON is a stream for another program to read, so the display gets out of its
+# way exactly as --plain does.
+[ "$JSON" = 0 ] || PLAIN=1
 
 # Does this date support %N? It does on Darwin 25, but older BSD date emits a
 # literal "N" and $((10#N)) is a bash syntax error, not a zero. Probe once here
@@ -375,6 +408,17 @@ stop() {
   # Both mechanisms, because either one alone leaves a window.
   [ -z "$RUNDIR" ] || : > "$RUNDIR/stop" 2>/dev/null
   [ -z "$PROD" ] || kill "$PROD" 2>/dev/null
+  # Give awk a moment to drain the fifo and run its END block before it is
+  # killed: that is where the summary and the verdict are written, and a
+  # Ctrl-C on a --summary run should still produce one. Bounded, because a
+  # hung awk must not turn a teardown into a hang.
+  if [ -n "$PIPE" ] && { [ "$SUMMARY" = 1 ] || [ -n "$FAILOVER" ] || [ -n "$FAILERR" ]; }; then
+    _g=0
+    while [ $_g -lt 20 ] && kill -0 "$PIPE" 2>/dev/null; do
+      sleep 0.05
+      _g=$(( _g + 1 ))
+    done
+  fi
   if [ -n "$RUNDIR" ] && [ -f "$RUNDIR/curl.pid" ]; then
     kill "$(cat "$RUNDIR/curl.pid" 2>/dev/null)" 2>/dev/null
   fi
@@ -435,7 +479,9 @@ awk -v win="$WIN" -v color="$COLOR" -v expect="$EXPECT" \
            -v tui="$TUI" -v cols="$COLS" -v rows="$ROWS" -v hdr="$HDR" -v url="$URL" \
            -v ivl="$INT" -v tmo="$TMO" -v ver="$VERSION" \
            -v wv="$WAVE" -v frm="$FRAME" -v nsok="$NSOK" \
-           -v mode="$MODE" -v modenote="$MODENOTE" -v hdrn="$HDRN" '
+           -v mode="$MODE" -v modenote="$MODENOTE" -v hdrn="$HDRN" \
+           -v json="$JSON" -v summary="$SUMMARY" -v rundir="$RUNDIR" \
+           -v failover="$FAILOVER" -v failerr="$FAILERR" '
 BEGIN {
   if (color) {
     R="\033[0m"; B="\033[1m"; D="\033[2m"
@@ -447,6 +493,16 @@ BEGIN {
   BL[1]="▁"; BL[2]="▂"; BL[3]="▃"; BL[4]="▄"
   BL[5]="▅"; BL[6]="▆"; BL[7]="▇"; BL[8]="█"
   BAD="╳"
+  # Run-wide totals, as distinct from the rolling window: the window answers
+  # "how is it now", these answer "how was the run". Keeping every latency would
+  # be unbounded — a day at one per second is 86400 of them — so percentiles come
+  # from a reservoir of at most RCAP samples, filled by algorithm R, which keeps
+  # a uniform sample of an arbitrarily long stream in fixed memory. The summary
+  # states the sample size, so the number is never presented as more exact than
+  # it is. Seeded fixed so two runs over the same data agree.
+  RCAP = 10000
+  srand(1)
+  runmin = -1
   L = rows - hdr                                  # visible list rows
   ln = 0                                          # how many are in use
   barw = cols - 34                                # bar must not wrap the line
@@ -658,6 +714,65 @@ function frame() {
   fflush()
 }
 $1 == "TICK" { frame(); next }
+
+# The summary is written to a file rather than printed, because on a terminal
+# the display is still on screen at this point and the shell prints it after the
+# cursor and scroll region have been restored. The verdict goes to a second file
+# so the exit status does not have to survive the fifo and the wait.
+function writesummary(   i, rp50, rp95, mean, dur, rate, v, line) {
+  if (!rundir) return
+  v = 0
+  mean = runok ? runsum/runok : 0
+  dur = (runt1 > runt0) ? runt1 - runt0 : 0
+  if (runok > 0) {
+    rn = (runok < RCAP) ? runok : RCAP
+    rp50 = pct(res, rn, 0.50)
+    rp95 = (rn >= 20) ? pct(res, rn, 0.95) : -1
+  }
+  if (summary) {
+    line = sprintf("\npulsecheck summary\n")
+    line = line sprintf("  target     %s  (%s)\n", url, mode)
+    line = line sprintf("  requests   %d in %s", runtot, span_s(dur))
+    if (dur > 0 && runtot > 1) line = line sprintf("  (one every %.2fs)", dur/(runtot-1))
+    line = line "\n"
+    line = line sprintf("  outcome    %d ok, %d failed, %.1f%% error\n", runok, runerr, \
+                        runtot ? 100*runerr/runtot : 0)
+    if (runok > 0) {
+      line = line sprintf("  latency    min %s  mean %s  p50 %s  p95 %s  max %s\n", \
+                          fmt(runmin), fmt(mean), fmt(rp50), \
+                          (rp95 < 0 ? "—" : fmt(rp95)), fmt(runmax))
+      line = line sprintf("             over %d successful request%s%s\n", runok, \
+                          (runok == 1 ? "" : "s"), \
+                          (runok > RCAP ? sprintf(", percentiles from a %d-sample reservoir", RCAP) : ""))
+    } else {
+      line = line "  latency    no successful request to measure\n"
+    }
+  }
+  # Thresholds are judged on the run, not on the last window: a CI gate asking
+  # "was this endpoint healthy for the duration" must not be decided by whatever
+  # happened to be in the buffer at the moment the run stopped.
+  if (failover != "") {
+    if (runok == 0 || rp95 < 0) {
+      if (summary) line = line sprintf("  p95 gate   —  (needs 20 successful requests, saw %d)\n", runok)
+      v = 1
+    } else {
+      if (summary) line = line sprintf("  p95 gate   %s vs %sms  %s\n", fmt(rp95), failover, \
+                                       (rp95 > failover+0) ? "FAIL" : "ok")
+      if (rp95 > failover+0) v = 1
+    }
+  }
+  if (failerr != "") {
+    erpct = runtot ? 100*runerr/runtot : 0
+    if (summary) line = line sprintf("  err gate   %.1f%% vs %s%%  %s\n", erpct, failerr, \
+                                     (erpct > failerr+0) ? "FAIL" : "ok")
+    if (erpct > failerr+0) v = 1
+  }
+  if (summary) printf "%s", line > (rundir "/summary")
+  printf "%d\n", v > (rundir "/verdict")
+  close(rundir "/summary")
+  close(rundir "/verdict")
+}
+END { writesummary() }
 {
   if (!t0) t0 = $2
   elapsed = $2 - t0
@@ -694,6 +809,18 @@ $1 == "TICK" { frame(); next }
   # showing; in plain mode there is no max column, so the aggregate is simply
   # absent until it is real and each line still carries its own sample.
   p95ok = (sm >= 20)
+
+  runtot++
+  if (bad) runerr++
+  else {
+    runok++; runsum += ms
+    if (runmin < 0 || ms < runmin) runmin = ms
+    if (ms > runmax) runmax = ms
+    if (runok <= RCAP) res[runok] = ms
+    else { rj = int(rand()*runok) + 1; if (rj <= RCAP) res[rj] = ms }
+  }
+  if (!runt0) runt0 = $2
+  runt1 = $2
   wscale()
 
   if (tui) {
@@ -726,6 +853,18 @@ $1 == "TICK" { frame(); next }
       for (k = 1; k <= L; k++) line(hdr + k, lb[k])
     }
     header()
+  } else if (json) {
+    # One object per line, so the stream is consumable by jq -c and by anything
+    # that reads a line at a time. p95 is null rather than a number while the
+    # rank cannot exclude a sample: a consumer can test for null, and would have
+    # no way to know a number was really the maximum.
+    printf "{\"t\":\"%s\",\"epoch\":%s,\"code\":\"%s\",\"ok\":%s,\"ms\":%.3f,\"reconnect\":%s,\"n\":%d,\"p50\":%s,\"p95\":%s,\"max\":%s,\"err_pct\":%.1f,\"ok_in_window\":%d,\"window_s\":%.1f}\n", \
+      $1, $2, code, (bad ? "false" : "true"), ms, (cn > 0 ? "true" : "false"), m, \
+      (sm ? sprintf("%.3f", p50) : "null"), \
+      (p95ok ? sprintf("%.3f", p95) : "null"), \
+      (sm ? sprintf("%.3f", mx) : "null"), \
+      er, sm, span
+    fflush()
   } else {
     printf "%s  HTTP %s%s%s  %s%-8s%s │ p95 %s%-8s%s  err %s%5.1f%%%s  n=%d\n", \
       $1, (bad?RED:""), code, (bad?R:""), col(ms,bad), fmt(ms), R, \
@@ -749,7 +888,7 @@ PIPE=$!
   # are added to every period. Sleeping interval-minus-time_total still runs
   # +5.4%: it cannot see its own fork cost, so it is systematically late and the
   # error accumulates forever. The grid bounds the drift at sleep granularity.
-  SEQ=0; T0=
+  SEQ=0; T0=; SENT=0
   if [ "$MODE" = reuse ]; then
     # ONE curl per batch, holding one connection for BATCH requests. Measured on
     # a real API: 53ms per request with a fresh process against 16ms once the
@@ -770,13 +909,24 @@ PIPE=$!
       echo $! > "$RUNDIR/curl.pid"
       while IFS= read -r L; do
         stamp
+        SENT=$(( SENT + 1 ))
         # Stamped at completion, not at start: curl never reports a request
         # start, and completion is the instant --rate itself paces on.
         printf '%s %s.%s %s\n' "$CLK" "$SEC" "${NS:0:6}" "$L"
         [ -n "$T0" ] || T0=$EPMS
         SEQ=$(( SEQ + 1 ))
         LASTMS=$EPMS
+        if [ "$COUNT" -gt 0 ] && [ "$SENT" -ge "$COUNT" ]; then
+          : > "$RUNDIR/stop"
+          break
+        fi
       done < "$RUNDIR/w"
+      # Stopping early means curl still has most of a batch queued — up to
+      # 20 x --window requests — and waiting for it would turn `-c 5` into a
+      # run of twelve hundred. Kill it first, then reap.
+      if [ -e "$RUNDIR/stop" ] && [ -f "$RUNDIR/curl.pid" ]; then
+        kill "$(cat "$RUNDIR/curl.pid" 2>/dev/null)" 2>/dev/null
+      fi
       wait 2>/dev/null
       [ -e "$RUNDIR/stop" ] && break
       # Re-anchor to the grid before relaunching, so per-batch drift cannot
@@ -799,6 +949,11 @@ PIPE=$!
       # connection, so flagging them all would flag nothing. Field 5 means "this
       # sample paid for a handshake its neighbours did not".
       printf '%s %s.%s %s 0\n' "$CLK" "$SEC" "${NS:0:6}" "$OUT"
+      SENT=$(( SENT + 1 ))
+      # Counted when emitted, and the loop leaves before pacing for a sample it
+      # is never going to send: otherwise -c 3 waits a full interval after the
+      # third request before it will admit to being finished.
+      if [ "$COUNT" -gt 0 ] && [ "$SENT" -ge "$COUNT" ]; then break; fi
 
       ELMS=$(to_ms "${OUT##* }")
       NOWMS=$(( EPMS + ELMS ))                # end of the request, estimated
@@ -824,3 +979,16 @@ PIPE=$!
 PROD=$!
 
 wait "$PIPE"
+
+# The run ended on its own (--count reached), rather than being interrupted.
+# Read what awk left behind before stop() removes the run directory.
+VERDICT=0
+[ ! -f "$RUNDIR/verdict" ] || VERDICT=$(cat "$RUNDIR/verdict" 2>/dev/null || echo 0)
+SUMTEXT=
+[ ! -f "$RUNDIR/summary" ] || SUMTEXT=$(cat "$RUNDIR/summary" 2>/dev/null || true)
+stop
+# Printed after the display has been restored, so it lands under the final
+# frame rather than inside a scroll region awk no longer owns.
+[ -z "$SUMTEXT" ] || printf '%s\n' "$SUMTEXT"
+case $VERDICT in ''|*[!0-9]*) VERDICT=0 ;; esac
+exit "$VERDICT"
