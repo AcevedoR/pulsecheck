@@ -1,6 +1,6 @@
 # pulsecheck — plan (draft)
 
-Status: **v0.2.0.** Not published. No remote configured.
+Status: **v0.3.0.** Published at github.com/AcevedoR/pulsecheck (public, MIT).
 Last updated: 2026-09-08
 
 ---
@@ -416,10 +416,18 @@ connection setup dominating the reported latency, a window that was not the
 duration it claimed, and percentiles contaminated by failures. All measured, all
 fixed, all recorded in section 4. Nothing else mattered until these did.
 
-**v0.3 — table stakes for a CLI other people run**
-- `-H/--header` pass-through. Most health endpoints worth watching sit behind
-  auth, and today there is no way to reach them. This is the single most likely
-  first complaint. With it: `--head`, `--insecure`, `--resolve`.
+**v0.3 — table stakes for a CLI other people run. IN PROGRESS.**
+- ~~`-H/--header` pass-through~~ **DONE in 0.3.0.** Repeatable, and passed to
+  curl through a config file in the 0700 run directory rather than on its
+  command line, so a credential is not copied into the argv of every request
+  curl makes — in fresh mode that is one new process per interval.
+  **The claim stops there, and the first version of this note overstated it:**
+  an inline `-H` is still in *this script own* argv and nothing here can change
+  that. Measured both ways against `ps`: with `-H @file` the token appears in no
+  process argv at all; inline it appears in two. So `@file` is documented as the
+  way to watch an authenticated endpoint without leaking to process listings,
+  and the display only ever shows a count (`· 2 headers`), never a name or a
+  value. Still open from this bullet: `--head`, `--insecure`, `--resolve`.
 - Portability and CI. The script has only ever run on macOS `/bin/bash` 3.2 with
   BWK awk; Linux ships gawk, mawk or busybox awk, and a tool that breaks on
   first contact with Linux has no adoption path. Needs a real matrix (macOS +

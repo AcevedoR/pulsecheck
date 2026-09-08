@@ -68,6 +68,7 @@ pulsecheck [options] <url>
   -i, --interval S   seconds between requests (default: 1)
   -t, --timeout S    per-request timeout, in seconds (default: 5)
   -e, --expect CODE  HTTP status treated as success (default: 200)
+  -H, --header H     request header, repeatable ("Name: value")
   -p, --plain        one self-contained line per sample, no fixed header
       --fresh        a new connection per request (default: reuse one)
       --color WHEN   auto, always or never (default: auto; NO_COLOR honoured)
@@ -84,6 +85,30 @@ pulsecheck -w 300 https://api.example.com/health      # 5-minute window
 pulsecheck -e 401 -i 0.5 https://api.example.com/me   # expect 401, 2 req/s
 pulsecheck -p https://api.example.com | tee probe.log # pipe-friendly stream
 ```
+
+## Authenticated endpoints
+
+`-H` passes a header through to curl and is repeatable:
+
+```sh
+pulsecheck -H "Authorization: Bearer $TOKEN" https://api.example.com/me
+pulsecheck -H "X-Api-Key: k" -H "Accept: application/json" https://api.example.com/health
+```
+
+Headers reach curl through a config file in a private (0700) temp directory
+rather than its command line, so a credential is not copied into the argv of
+every request curl makes — in `--fresh` mode that is one new process per
+interval. **Your own invocation is still visible in `ps`**, though, so for a
+real secret put the header in a file and use curl's `@` form:
+
+```sh
+umask 077; printf 'Authorization: Bearer %s\n' "$TOKEN" > auth.txt
+pulsecheck -H @auth.txt https://api.example.com/me
+```
+
+Verified both ways: with `@auth.txt` the token appears in no process's argv;
+passed inline it appears in pulsecheck's own. Header values are never printed —
+the display shows only a count (`· 2 headers`).
 
 ## What it measures
 

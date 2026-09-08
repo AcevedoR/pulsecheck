@@ -2,7 +2,7 @@
 # pulsecheck — watch an HTTP endpoint's pulse: live latency with a rolling p95 and error rate.
 set -u
 
-VERSION=0.2.0
+VERSION=0.3.0
 WIN=60
 INT=1
 TMO=5
@@ -13,6 +13,8 @@ DIAG=0
 RECORD=
 FRESH=0
 WHEN=auto      # --color: auto, always or never
+HDRS=          # accumulated curl config lines, one per --header
+HDRN=0
 FRAME=0.1      # animation tick, seconds (10fps) — only when the wave is on
 HDR=5          # header lines held above the scroll region (6 with the wave)
 
@@ -28,6 +30,7 @@ Options:
   -i, --interval S   seconds between requests (default: 1)
   -t, --timeout S    per-request timeout, in seconds (default: 5)
   -e, --expect CODE  HTTP status treated as success (default: 200)
+  -H, --header H     request header, repeatable ("Name: value")
   -p, --plain        one self-contained line per sample, no fixed header
       --fresh        a new connection per request (default: reuse one)
       --color WHEN   auto, always or never (default: auto; NO_COLOR honoured)
@@ -56,6 +59,12 @@ a new connection per request, which is the right measurement when cold-connect
 cost is what you care about. The header always names the active mode, because
 otherwise the numbers are ambiguous.
 
+Headers reach curl through a config file in a private temp directory rather than
+its command line, so a credential is not repeated into the argv of every request
+curl makes. Your own invocation is still visible in ps: to keep a token out of
+process listings entirely, put the header in a file and pass -H @that-file.
+Header values are never printed — the display shows only how many are set.
+
 Latency aggregates cover successful requests only, and the header says how many
 that is. A refused connection returns in microseconds, so mixing failures in
 drags p95 DOWN exactly when things are worst. err% still covers every request.
@@ -82,6 +91,23 @@ while [ $# -gt 0 ]; do
     -i|--interval) [ $# -ge 2 ] || die "$1 needs a value"; INT=$2; shift 2 ;;
     -t|--timeout)  [ $# -ge 2 ] || die "$1 needs a value"; TMO=$2; shift 2 ;;
     -e|--expect)   [ $# -ge 2 ] || die "$1 needs a value"; EXPECT=$2; shift 2 ;;
+    -H|--header)
+      [ $# -ge 2 ] || die "$1 needs a value"
+      # curl also accepts "Name;" (send empty) and "@file"; anything without one
+      # of those shapes is almost certainly a quoting mistake that would
+      # otherwise be silently swallowed as a header named after the whole string
+      case $2 in
+        *:*|*\;|@*) ;;
+        *) die "--header needs \"Name: value\" (got: $2)" ;;
+      esac
+      # Escape for curl config syntax: backslash first, then the quote, or the
+      # second pass would double-escape what the first one added.
+      _h=${2//\\/\\\\}
+      _h=${_h//\"/\\\"}
+      HDRS="${HDRS}header = \"${_h}\"
+"
+      HDRN=$(( HDRN + 1 ))
+      shift 2 ;;
     -p|--plain)    PLAIN=1; shift ;;
     --no-wave)     WAVE=0; shift ;;
     --fresh)       FRESH=1; shift ;;
@@ -255,6 +281,18 @@ fi
 # half-configured terminal behind.
 RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/pulsecheck.XXXXXX") || die "cannot create a run directory"
 mkfifo "$RUNDIR/stream" || die "cannot create a pipe in $RUNDIR"
+# Always written, even when empty: an empty -K file is a no-op for curl, and
+# passing it unconditionally keeps the invocation free of conditional argument
+# splicing, which bash 3.2 cannot do safely without arrays. mktemp -d gives a
+# 0700 directory.
+#
+# What this does and does not buy: a credential is not copied into the argv of
+# every curl this runs, which in fresh mode is one new process per interval.
+# It does NOT hide an inline -H from ps, because that is this script own argv
+# and nothing here can change it — verified, both ways. curl -H @file is the
+# form that keeps a token out of process listings altogether, and it is passed
+# straight through.
+printf '%s' "$HDRS" > "$RUNDIR/headers" || die "cannot write $RUNDIR/headers"
 if [ "$MODE" = reuse ]; then
   mkfifo "$RUNDIR/w" || die "cannot create a pipe in $RUNDIR"
   # Paired url/output entries, written once and reused for every batch. A bare
@@ -334,7 +372,7 @@ awk -v win="$WIN" -v color="$COLOR" -v expect="$EXPECT" \
            -v tui="$TUI" -v cols="$COLS" -v rows="$ROWS" -v hdr="$HDR" -v url="$URL" \
            -v ivl="$INT" -v tmo="$TMO" -v ver="$VERSION" \
            -v wv="$WAVE" -v frm="$FRAME" -v nsok="$NSOK" \
-           -v mode="$MODE" -v modenote="$MODENOTE" '
+           -v mode="$MODE" -v modenote="$MODENOTE" -v hdrn="$HDRN" '
 BEGIN {
   if (color) {
     R="\033[0m"; B="\033[1m"; D="\033[2m"
@@ -519,8 +557,11 @@ function header(   l1,l2,l3,l4,ec) {
   # The per-sample cadence needs sub-second timestamps to be worth printing, and
   # it needs 78 columns; the split display only guarantees 71.
   if (slip && nsok && cols >= 80) spantxt = spantxt sprintf(" (%s/sample)", span_s(cad))
-  l2 = sprintf("%sexpect %s · every %ss · timeout %ss · window %s / %s%s%s", \
-               D, expect, ivl, tmo, wintxt, (slip ? R YEL : ""), spantxt, R)
+  # The count only, never the values: a header is the one input to this tool
+  # that routinely holds a credential.
+  hdrtxt = (hdrn > 0) ? sprintf(" · %d header%s", hdrn, (hdrn == 1 ? "" : "s")) : ""
+  l2 = sprintf("%sexpect %s · every %ss · timeout %ss%s · window %s / %s%s%s", \
+               D, expect, ivl, tmo, hdrtxt, wintxt, (slip ? R YEL : ""), spantxt, R)
   if (n == 0) {
     l3 = sprintf("last %-9s %sp50%s %-9s %sp95%s %-9s %smax%s %s", DASH, D,R, DASH, D,R, DASH, D,R, DASH)
     l4 = sprintf("err  %-9s %sn%s 0/%d", DASH, D,R, win)
@@ -647,7 +688,7 @@ PIPE=$!
       # delivers a whole batch at exit, which would freeze the display and then
       # dump it. stderr is unbuffered and streams line by line. -N does not
       # help, and a bare %stderr form prints literally.
-      curl -s -K "$RUNDIR/urls" --rate "${RATE}/d" -m "$TMO" \
+      curl -s -K "$RUNDIR/headers" -K "$RUNDIR/urls" --rate "${RATE}/d" -m "$TMO" \
         -w '%{stderr}%{http_code} %{time_total} %{num_connects}\n' \
         2>"$RUNDIR/w" >/dev/null &
       echo $! > "$RUNDIR/curl.pid"
@@ -674,7 +715,8 @@ PIPE=$!
   else
     while :; do
       stamp
-      OUT=$(curl -s -o /dev/null -m "$TMO" -w '%{http_code} %{time_total}' "$URL")
+      OUT=$(curl -s -K "$RUNDIR/headers" -o /dev/null -m "$TMO" \
+            -w '%{http_code} %{time_total}' "$URL")
       # 6 fractional digits, not 9: an IEEE double holds about 16 significant
       # digits, so the last three would be lost silently. Truncating is plainer.
       # The trailing 0 is field 5: in fresh mode every request pays for its own
