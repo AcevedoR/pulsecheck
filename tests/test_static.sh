@@ -24,6 +24,15 @@ if command -v python3 >/dev/null; then
   sed 's/-v hdrn="\$HDRN"/ /' $SRC > "$TMP/broken"
   assert_eq "the audit catches a removed binding" "hdrn" \
     "$(python3 tests/awkvars.py "$TMP/broken")"
+
+  # A local sharing a function's name shadows it for the whole body. gawk and
+  # BWK awk allow it; mawk refuses the definition and then reads the body as
+  # top-level code, producing a wall of syntax errors nowhere near the cause.
+  # That cost a CI round: a summary function with a local called line, beside a
+  # function called line().
+  sed 's/function writesummary(   rp50,/function writesummary(   line,/' $SRC > "$TMP/shadow"
+  assert_contains "the audit catches a local shadowing a function" \
+    "shadows the function line()" "$(python3 tests/awkvars.py "$TMP/shadow")"
 else
   echo "  skip python3 not available"
 fi
@@ -31,11 +40,15 @@ fi
 echo
 echo "the awk program contains no apostrophe"
 
-# It lives inside a single-quoted shell string, so one apostrophe anywhere in
-# it — including in a comment — ends the quote and hands the remainder of the
-# program to bash. The closing delimiter is the only legitimate match.
-assert_eq "only the closing delimiter matches" "1" \
-  "$(sed -n "/^BEGIN {/,/^}' </p" $SRC | grep -c "'")"
+# One apostrophe anywhere in it, including in a comment, closes the shell
+# string it lives in and hands the rest of the file to bash. Counted by
+# tests/awkquote.py rather than by sed and grep, which disagreed across
+# platforms for the same file.
+if command -v python3 >/dev/null; then
+  assert_eq "none in the program body" "0" "$(python3 tests/awkquote.py $SRC)"
+else
+  echo "  skip python3 not available"
+fi
 
 echo
 echo "the script parses"
