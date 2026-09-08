@@ -3,6 +3,10 @@
 Watch an HTTP endpoint's pulse: live per-request latency, plus a **rolling** p95
 and error rate over the last N samples.
 
+<img src="docs/demo.svg" alt="pulsecheck watching an endpoint: a fixed header with rolling p50, p95, max and error rate over a three-row heartbeat trace, above a scrolling list of requests" width="100%">
+
+*A real run against `example.com`, replayed from a `--record` capture — not a mockup.*
+
 On a terminal the display splits into a fixed header — target, probe settings,
 rolling aggregates and a heartbeat trace of the window — with the requests
 listed underneath.
@@ -55,9 +59,33 @@ script and one awk program, with no dependency beyond `curl`.
 ## Install
 
 ```sh
-curl -fsSLo /usr/local/bin/pulsecheck \
+curl -fsSL https://raw.githubusercontent.com/AcevedoR/pulsecheck/main/install.sh | sh
+```
+
+Somewhere that needs no `sudo`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AcevedoR/pulsecheck/main/install.sh \
+  | PREFIX=~/.local/bin sh
+```
+
+The installer checks that what it downloaded is actually the script — a shebang,
+a version line, and `bash -n` — before putting it on your PATH, because a proxy
+error page installed as a program is a worse outcome than a failed install.
+
+With Homebrew:
+
+```sh
+brew install --HEAD https://raw.githubusercontent.com/AcevedoR/pulsecheck/main/Formula/pulsecheck.rb
+```
+
+Or just take the file: it is one script with no dependency beyond `curl` and
+`awk`, both of which you already have.
+
+```sh
+curl -fsSLo ~/bin/pulsecheck \
   https://raw.githubusercontent.com/AcevedoR/pulsecheck/main/pulsecheck
-chmod +x /usr/local/bin/pulsecheck
+chmod +x ~/bin/pulsecheck
 ```
 
 ## Usage
