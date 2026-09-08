@@ -371,6 +371,18 @@ number it produced or a byte sequence it passes through, and the terminal
 decodes the UTF-8 glyphs by its own rules regardless. `tests/test_locale.sh`
 pins it, and the CI matrix installs `de_DE.UTF-8` so the check has teeth.
 
+**A fourth, which cost five CI rounds:** the end-to-end tests killed a probe
+after N lines in order to read its output. On one runner the output never
+arrived at all — the server logged the requests, a direct curl to the same url
+answered 200, stderr was empty, and the tool was plainly working while the
+harness could not see it. Each rerun failed on a different assertion, which is
+the signature of a harness race rather than a defect. Two real bugs came out of
+chasing it (both test servers were single-threaded and stalled on a killed
+keep-alive connection), but the fix in the end was to stop killing the thing
+under test: with `--count` a run ends itself, having flushed and closed what it
+owns before the test reads a byte. That also took the suite from tens of
+seconds to about two.
+
 **Three harness failures that each looked like a bug in the program:**
 
 - SIGINT "did not terminate the script". It does, in 0.01s. The first harness

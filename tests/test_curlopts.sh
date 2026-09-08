@@ -33,30 +33,24 @@ assert_status "--insecure needs no value" 0 -- $PC --insecure --diag
 
 command -v python3 >/dev/null || { echo "python3 not found; skipping the rest" >&2; summary; exit; }
 
-# probe URL EXTRA... -> the lines of a short run
+# probe URL EXTRA... -> the lines of a bounded run
+#
+# The run ends itself with --count rather than being killed after N lines. That
+# was not available when these tests were written, and killing a probe to read
+# its output turned out to be the whole source of their flakiness: on one CI
+# runner the output never arrived at all, while the server logged the requests
+# happily, so the tool was working and the harness could not see it. A run that
+# exits on its own has flushed and closed everything it owns before this reads
+# a byte of it.
 probe() {
-  local out=$TMP/out
-  : > "$out"
-  ( $PC -p -i 0.1 -t 2 "$@" >"$out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
-  local pid; pid=$(cat "$TMP/pid")
-  # One line is enough for every assertion here, and waiting for three tripled
-  # the window in which a slow runner could produce nothing at all.
-  local i=0
-  while [ ! -s "$out" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-  if [ -s "$out" ]; then
-    cat "$out"
+  : > "$TMP/out"
+  $PC -p -i 0.1 -t 2 -c 3 "$@" > "$TMP/out" 2> "$TMP/err"
+  if [ -s "$TMP/out" ]; then
+    cat "$TMP/out"
   else
-    # An empty result is indistinguishable from a wrong one, and the reason is
-    # on stderr. Surfacing it here puts it in the failure message instead of
-    # leaving the next reader to guess from a CI log.
-    # Distinguish the two ways this can be empty: the server never answered,
-    # or it answered and pulsecheck said nothing about it. One direct request
-    # settles which, and without it the next reader is where I was — guessing.
     direct=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "${@: -1}" 2>&1 || echo "curl-failed")
-    printf '(no output after %ss; stderr: %s; a direct curl to the same url got %s; %s curl procs alive)\n' \
-      "$((i / 10))" "$(tr '\n' ' ' < "$TMP/err" | cut -c1-200)" "$direct" \
-      "$(pgrep -c curl 2>/dev/null || echo 0)"
+    printf '(no output; stderr: %s; a direct curl to the same url got %s)\n' \
+      "$(tr '\n' ' ' < "$TMP/err" | cut -c1-200)" "$direct"
   fi
 }
 
