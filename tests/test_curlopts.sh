@@ -39,10 +39,20 @@ probe() {
   : > "$out"
   ( $PC -p -i 0.1 -t 2 "$@" >"$out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
   local pid; pid=$(cat "$TMP/pid")
+  # One line is enough for every assertion here, and waiting for three tripled
+  # the window in which a slow runner could produce nothing at all.
   local i=0
-  while [ "$(wc -l < "$out")" -lt 3 ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
+  while [ ! -s "$out" ] && [ $i -lt 200 ]; do sleep 0.1; i=$((i+1)); done
   kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
-  cat "$out"
+  if [ -s "$out" ]; then
+    cat "$out"
+  else
+    # An empty result is indistinguishable from a wrong one, and the reason is
+    # on stderr. Surfacing it here puts it in the failure message instead of
+    # leaving the next reader to guess from a CI log.
+    printf '(no output after %ss; stderr: %s)\n' "$((i / 10))" \
+      "$(tr '\n' ' ' < "$TMP/err" | cut -c1-300)"
+  fi
 }
 
 echo
