@@ -2,6 +2,17 @@
 # pulsecheck — watch an HTTP endpoint's pulse: live latency with a rolling p95 and error rate.
 set -u
 
+# Numeric parsing is locale-sensitive and awk is where it bites: under a locale
+# whose decimal separator is a comma, "0.0532" * 1000 evaluates to 0 and every
+# latency on screen reads 0,0ms. Verified on this machine under de_DE.UTF-8 and
+# fr_FR.UTF-8 with BWK awk; the audit reports the same for mawk. That is silent
+# total data loss for a large part of Europe, so the whole script runs in the C
+# locale. It costs nothing here: every string this program formats is either a
+# number it produced itself or a byte sequence it passes through untouched, and
+# the terminal decodes the UTF-8 glyphs by its own rules regardless.
+LC_ALL=C
+export LC_ALL
+
 VERSION=0.3.0
 WIN=60
 INT=1
@@ -160,6 +171,20 @@ stamp() {
 IMS=$(to_ms "$INT")
 [ "$IMS" -gt 0 ] || die "--interval must be greater than zero"
 
+# Validated here rather than beside the other argument checks because to_ms has
+# to exist first; a function used above its definition is empty at that point,
+# not an error, which is its own class of silent bug.
+case $TMO in
+  ''|*[!0-9.]*|*.*.*) die "--timeout must be a positive number" ;;
+esac
+[ "$(to_ms "$TMO")" -gt 0 ] || die "--timeout must be greater than zero"
+# curl reports 000 when it never got a status, so expecting it is legitimate;
+# anything non-numeric is a typo that would otherwise make every request look
+# like a failure with no explanation.
+case $EXPECT in
+  ''|*[!0-9]*) die "--expect must be a 3-digit HTTP status (or 000)" ;;
+esac
+
 # Does this date support %N? It does on Darwin 25, but older BSD date emits a
 # literal "N" and $((10#N)) is a bash syntax error, not a zero. Probe once here
 # rather than discover it inside the loop. The awk side needs no probe: awk
@@ -248,6 +273,12 @@ if [ "$COLOR" = 1 ] && { [ "$PLAIN" = 0 ] || [ "$DIAG" = 1 ]; }; then
   fi
   case $ROWS in ''|*[!0-9]*) ROWS=24; TUI=0 ;; esac
   case $COLS in ''|*[!0-9]*) COLS=80; TUI=0 ;; esac
+  # A terminal that answers the cursor probe with 9999;9999 would have awk build
+  # trace rows thousands of characters long, which is the shape that overruns
+  # mawk fixed sprintf buffer. Nothing legible needs more than this, and a real
+  # terminal never exceeds it.
+  [ "$ROWS" -le 200 ] || ROWS=200
+  [ "$COLS" -le 400 ] || COLS=400
   [ "$ROWS" -ge $((HDR + 5)) ] || TUI=0
   [ "$COLS" -ge 72 ] || TUI=0
 fi
@@ -319,6 +350,7 @@ cleanup() {
 }
 PIPE=
 PROD=
+TEE=
 # The probe runs as background jobs and the script waits on them, rather than in
 # the foreground: bash defers a trap until the foreground command returns, so a
 # plain `kill` on this script would otherwise never run cleanup and would leave
@@ -329,7 +361,15 @@ PROD=
 # when the producer wrote once per interval and died at its next write, but a
 # reused connection means one long-lived curl holding an open socket, so a
 # SIGPIPE can arrive an interval late or not at all.
+STOPPED=0
 stop() {
+  # Idempotent: INT/TERM runs this and then the EXIT trap runs it again. Without
+  # the guard the second pass writes the sentinel into a directory the first
+  # pass has already removed, and bash prints "No such file or directory" onto a
+  # terminal that awk was until a moment ago drawing on. Same class as the
+  # redirection-order bug in the size probe: the error text is the damage.
+  [ "$STOPPED" = 0 ] || return 0
+  STOPPED=1
   # The sentinel closes a race the kills cannot: the producer relaunches curl
   # whenever its reader sees EOF, so killing curl alone can start a new batch.
   # Both mechanisms, because either one alone leaves a window.
@@ -344,6 +384,15 @@ stop() {
   # awk last: it is the only writer to the terminal, so it outlives what feeds it.
   [ -z "$PIPE" ] || kill "$PIPE" 2>/dev/null
   cleanup
+  # The recorder is closed and reaped AFTER cleanup, so the escape codes that
+  # restore the terminal are in the recording too — the tests replay it and a
+  # missing reset would look like a bug in the display rather than in the
+  # harness. Closing stdout is what gives tee its EOF.
+  if [ -n "$TEE" ]; then
+    exec >&-
+    wait "$TEE" 2>/dev/null
+    TEE=
+  fi
   [ -z "$RUNDIR" ] || rm -rf "$RUNDIR" 2>/dev/null
 }
 trap 'stop' EXIT
@@ -351,7 +400,21 @@ trap 'stop; exit 130' INT TERM
 
 # Duplicate everything drawn from here on into the recording file. Placed after
 # the geometry probes so it cannot change what they see.
-[ -z "$RECORD" ] || exec > >(tee "$RECORD")
+#
+# A fifo and a tracked tee rather than `exec > >(tee ...)`. Process substitution
+# is a bashism that makes the whole file unparseable to a POSIX shell — it dies
+# before it can print --help — and, worse for a recorder the tests depend on,
+# nothing ever waits for that tee, so it can be killed mid-flush and truncate
+# the recording. Here the pid is known, stdout is closed to signal EOF, and the
+# wait is explicit.
+TEE=
+if [ -n "$RECORD" ]; then
+  mkfifo "$RUNDIR/disp" || die "cannot create a pipe in $RUNDIR"
+  : > "$RECORD" || die "cannot write $RECORD"
+  tee "$RECORD" < "$RUNDIR/disp" &
+  TEE=$!
+  exec > "$RUNDIR/disp"
+fi
 
 if [ "$TUI" = 1 ]; then
   # Reset any scroll region a previous run may have left, clear, hide cursor.

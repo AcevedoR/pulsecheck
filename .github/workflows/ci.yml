@@ -10,13 +10,44 @@ jobs:
     # pulsecheck is a bash/awk script that has to work on both a Linux box and
     # the macOS it is mostly used from, where awk is BWK awk and bash is 3.2 —
     # the two places its portability actually gets decided.
+    #
+    # The awk dimension is the point of the Linux half: the three dialects
+    # disagree in ways that have already produced silent wrong output here, and
+    # Ubuntu's default is mawk while macOS ships BWK awk. gawk is the odd one
+    # out on locale handling, so it is the one that would hide a regression of
+    # the LC_ALL fix rather than catch it — all three run.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            awk: mawk           # Ubuntu's default
+          - os: ubuntu-latest
+            awk: gawk
+          - os: ubuntu-latest
+            awk: original-awk   # BWK awk, what macOS ships
+          - os: macos-latest
+            awk: system         # BWK awk, no package needed
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Select the awk under test
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "${{ matrix.awk }}"
+          # Point /usr/bin/awk at it, so the suite and the script both pick it
+          # up without either of them knowing this job exists.
+          sudo update-alternatives --set awk "/usr/bin/${{ matrix.awk }}"
+
+      - name: Install a comma-decimal locale
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          # Without this the locale regression test can only check that the
+          # LC_ALL line is present, not that it works.
+          sudo locale-gen de_DE.UTF-8
+          sudo update-locale
 
       - name: Show the tools under test
         run: |
@@ -24,6 +55,7 @@ jobs:
           awk --version 2>/dev/null | head -1 || awk -W version 2>&1 | head -1 || true
           curl --version | head -1
           python3 --version
+          locale -a | grep -i 'de_DE\|fr_FR' || echo "no comma-decimal locale"
 
       - name: Syntax-check the script
         run: bash -n pulsecheck
