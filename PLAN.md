@@ -330,6 +330,37 @@ header off the top, discarding the final frame — which is the thing worth
 keeping after Ctrl-C. The alternate screen buffer was considered and rejected
 for the same reason: it would wipe the last numbers off the display on exit.
 
+**The worst bug in the project so far, found by a portability audit rather than
+by use:** awk parses and formats numbers according to the locale, so under one
+with a comma decimal separator — German, French, most of Europe — `"0.0532" *
+1000` evaluates to **0** and `printf "%.1f"` emits `53,0`. Every latency on
+screen reads `0,0ms`. Not a crash, not a warning: the tool simply reports
+nothing at all, confidently, to a third of its potential users. Reproduced here
+on BWK awk under `de_DE.UTF-8` and `fr_FR.UTF-8`, and reported for mawk, which
+is Ubuntu default awk; gawk is the one implementation that mitigates it, which
+means the bug would have been invisible on a developer machine with gawk and
+live on the same code in CI. The fix is one line — the script runs in the C
+locale — and it costs nothing, because every string it formats is either a
+number it produced or a byte sequence it passes through, and the terminal
+decodes the UTF-8 glyphs by its own rules regardless. `tests/test_locale.sh`
+pins it, and the CI matrix installs `de_DE.UTF-8` so the check has teeth.
+
+**Three harness failures that each looked like a bug in the program:**
+
+- SIGINT "did not terminate the script". It does, in 0.01s. The first harness
+  started pulsecheck as a background job of a non-interactive shell, where
+  POSIX requires SIGINT to be ignored and no `trap` can override it. The second
+  killed its own process group and took python with it. The third stopped
+  reading the pty after signalling, so cleanup blocked writing to a full
+  terminal buffer and never reached its own exit. Three separate ways to
+  measure the wrong thing.
+- A "hang" that was an unbounded drain loop in the test, spinning while the
+  program under test was already dead.
+- Every awk-dialect claim in the audit was marked UNVERIFIED because gawk and
+  mawk are not installed on this machine, which is exactly why the CI matrix
+  now selects the awk implementation instead of trusting whichever one happens
+  to be on PATH.
+
 **Five more from the v0.2 round, in the same spirit:**
 
 1. **`spos` was read but never assigned** after the trace became three rows, so
@@ -403,8 +434,8 @@ used and is present in BWK awk. **Untested on Linux** (gawk/mawk) — see §6.
 - One process per endpoint.
 - The header and the list are sized once, from the terminal, at startup. A
   resize mid-run is not detected.
-- **SIGINT teardown is untested** (see section 4). SIGTERM is verified.
-- **Untested on Linux** (gawk/mawk/busybox awk, bash 5.x) — see section 6.
+- Killing with SIGKILL leaves the run directory behind, as nothing can run on
+  SIGKILL. SIGINT and SIGTERM both remove it.
 
 ## 6. Roadmap — what "usable by a lot of devs" actually requires
 
@@ -428,12 +459,16 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
   way to watch an authenticated endpoint without leaking to process listings,
   and the display only ever shows a count (`· 2 headers`), never a name or a
   value. Still open from this bullet: `--head`, `--insecure`, `--resolve`.
-- Portability and CI. The script has only ever run on macOS `/bin/bash` 3.2 with
-  BWK awk; Linux ships gawk, mawk or busybox awk, and a tool that breaks on
-  first contact with Linux has no adoption path. Needs a real matrix (macOS +
-  Linux x bash 3.2/5.x x BWK/gawk/mawk) and a test suite worth running: the ANSI
-  screen model in `tests/` for display assertions, plus the awk program fed
-  synthetic streams for the statistics.
+- ~~Portability and CI~~ **IN PROGRESS.** A suite exists (`tests/`, 127
+  assertions across cli, awk, locale, screen and e2e) and CI runs it on
+  ubuntu-latest and macos-latest across mawk, gawk and BWK awk, with a
+  comma-decimal locale installed so the locale regression has something to bite
+  on. What that shook out is above: the locale bug, an unclamped geometry that
+  would have handed mawk a sprintf overrun, and `--record` built on process
+  substitution — unportable, unwaited (so recordings truncated, weakening the
+  very harness CI depends on), and enough to make the file unparseable to a
+  POSIX shell. Still open: busybox awk, and bash 5.x is only covered
+  incidentally by whatever Ubuntu ships.
 - `--json` line output, a summary on exit, and a non-zero exit when a threshold
   was breached. Devs pipe things and gate CI on them; without this the tool
   cannot participate in either.
