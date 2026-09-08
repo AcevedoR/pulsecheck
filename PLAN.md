@@ -330,6 +330,21 @@ header off the top, discarding the final frame — which is the thing worth
 keeping after Ctrl-C. The alternate screen buffer was considered and rejected
 for the same reason: it would wipe the last numbers off the display on exit.
 
+**A number that was wrong on every run, for the first twenty seconds of it:**
+nearest rank `ceil(0.95*m)` equals `m` for every `m` below 20, so with a
+partially filled window "p95" was simply the maximum under another name. Every
+run opens on a connection handshake, which is the maximum. Measured on a steady
+16ms endpoint: p95 read **90.0ms** from the first sample to the nineteenth, then
+snapped to 16.8ms at the twentieth — the tool contradicting itself inside the
+first twenty seconds of every run, and doing it in the place a new user looks
+first. Nothing about the percentile code was wrong; the mistake was printing a
+statistic whose rank could not yet exclude a single sample. It is now withheld
+until 20 successful samples are in the window, on the same principle as the
+dashes for a window with no successes: `max` was already on that row and is the
+honest name for the number it was showing. `tests/test_window.sh` drives the
+whole awk program to pin it, which is also the first test here that exercises
+the rendering path rather than an extracted function.
+
 **The worst bug in the project so far, found by a portability audit rather than
 by use:** awk parses and formats numbers according to the locale, so under one
 with a comma decimal separator — German, French, most of Europe — `"0.0532" *
@@ -408,8 +423,9 @@ used and is present in BWK awk. **Untested on Linux** (gawk/mawk) — see §6.
 
 ## 5. Known limitations
 
-- p95 is nearest-rank, not interpolated. At `-w 20` "p95" is just the worst
-  successful sample in the window.
+- p95 is nearest-rank, not interpolated, and is withheld below 20 successful
+  samples because that is where the rank stops excluding anything (see the bug
+  records). A `--window` under 20 therefore never shows a p95.
 - **Aggregates cover successes only, which means a failing endpoint has fewer
   samples behind its numbers than the `n` beside them.** `over N ok` states the
   denominator for exactly this reason. With no successes at all the percentiles
