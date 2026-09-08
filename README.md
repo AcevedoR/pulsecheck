@@ -70,6 +70,9 @@ pulsecheck [options] <url>
   -t, --timeout S    per-request timeout, in seconds (default: 5)
   -e, --expect CODE  HTTP status treated as success (default: 200)
   -H, --header H     request header, repeatable ("Name: value")
+      --head         probe with HEAD instead of GET
+      --insecure     do not verify the TLS certificate
+      --resolve SPEC pin a host to an address, repeatable (HOST:PORT:ADDR)
   -p, --plain        one self-contained line per sample, no fixed header
       --json         one JSON object per sample on stdout
   -c, --count N      stop after N samples (default: run until interrupted)
@@ -115,6 +118,26 @@ pulsecheck -H @auth.txt https://api.example.com/me
 Verified both ways: with `@auth.txt` the token appears in no process's argv;
 passed inline it appears in pulsecheck's own. Header values are never printed —
 the display shows only a count (`· 2 headers`).
+
+## Probing awkward endpoints
+
+```sh
+pulsecheck --head https://api.example.com/large            # skip the body
+pulsecheck --insecure https://staging.internal/health      # self-signed cert
+pulsecheck --resolve api.example.com:443:10.0.0.7 \
+           https://api.example.com/health                  # pin to one backend
+```
+
+`--head` sends HEAD, so an endpoint that returns a large body can be timed
+without transferring it — but note it measures a different thing, and some
+servers handle HEAD on a separate path. `--insecure` skips certificate
+verification and says so in yellow on the header, because that qualifies every
+number below it. `--resolve` is repeatable and takes curl's `HOST:PORT:ADDRESS`
+form, which is the way to watch one backend behind a load balancer or DNS
+round-robin.
+
+All three are passed through to curl by way of the same private config file as
+`-H`.
 
 ## Scripting and CI
 

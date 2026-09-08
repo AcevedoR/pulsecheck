@@ -1,16 +1,39 @@
 #!/usr/bin/env python3
-"""A throwaway HTTP server for the end-to-end test.
+"""A throwaway HTTP server for the end-to-end tests.
 
 Serves a fixed status on every path (or the status named by the path, so
 /503 answers 503) and prints the port it bound to on stdout, so the test does
 not have to guess a free one.
+
+It records the request methods it saw in a file named by $SEEN_METHODS, when
+that is set, so a test can assert that --head actually sends HEAD rather than
+trusting that the flag reached curl.
 """
+import os
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+SEEN = os.environ.get("SEEN_METHODS")
+
+
+def record(method):
+    if not SEEN:
+        return
+    with open(SEEN, "a") as fh:
+        fh.write(method + "\n")
+
 
 class Handler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        record("HEAD")
+        # A HEAD response carries the headers of the GET and no body.
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain")
+        self.send_header("Content-Length", "3")
+        self.end_headers()
+
     def do_GET(self):
+        record("GET")
         try:
             code = int(self.path.strip("/"))
         except ValueError:

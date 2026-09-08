@@ -6,7 +6,7 @@
 set -u
 cd "$(dirname "$0")/.."
 
-SUITES=${*:-static cli awk window json locale screen e2e}
+SUITES=${*:-static cli awk window json locale screen e2e curlopts}
 RC=0
 
 for s in $SUITES; do
