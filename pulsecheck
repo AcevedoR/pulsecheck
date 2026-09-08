@@ -509,7 +509,8 @@ awk -v win="$WIN" -v color="$COLOR" -v expect="$EXPECT" \
            -v wv="$WAVE" -v frm="$FRAME" -v nsok="$NSOK" \
            -v mode="$MODE" -v modenote="$MODENOTE" -v hdrn="$HDRN" \
            -v json="$JSON" -v summary="$SUMMARY" -v rundir="$RUNDIR" \
-           -v failover="$FAILOVER" -v failerr="$FAILERR" '
+           -v failover="$FAILOVER" -v failerr="$FAILERR" \
+           -v meth="$METH" -v insec="$INSEC" '
 BEGIN {
   if (color) {
     R="\033[0m"; B="\033[1m"; D="\033[2m"

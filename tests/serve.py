@@ -11,7 +11,7 @@ trusting that the flag reached curl.
 """
 import os
 import sys
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 SEEN = os.environ.get("SEEN_METHODS")
 
@@ -49,7 +49,14 @@ class Handler(BaseHTTPRequestHandler):
         pass
 
 
-srv = HTTPServer(("127.0.0.1", 0), Handler)
+# Threaded, not the plain single-connection server: pulsecheck holds one
+# keep-alive connection open for a whole batch of requests, and a test that
+# kills it mid-flight can leave a single-threaded server blocked on the dead
+# socket — so the *next* probe in the suite gets no response at all and looks
+# like a bug in the program. That produced three "empty output" failures on one
+# CI runner while the same tests passed on three others.
+srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+srv.daemon_threads = True
 print(srv.server_port, flush=True)
 sys.stdout.close()
 srv.serve_forever()
