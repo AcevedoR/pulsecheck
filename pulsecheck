@@ -639,7 +639,8 @@ function header(   l1,l2,l3,l4,ec) {
     else
       l3 = sprintf("last %s%-9s%s %sp50%s %s%-9s%s %sp95%s %s%-9s%s %smax%s %s%-9s%s %sover %d ok%s",
                    col(ms,bad), fmt(ms), R, D,R, col(p50,0), fmt(p50), R,
-                   D,R, col(p95,0), fmt(p95), R, D,R, col(mx,0), fmt(mx), R,
+                   D,R, (p95ok ? col(p95,0) : ""), (p95ok ? fmt(p95) : DASH), R, \
+                   D,R, col(mx,0), fmt(mx), R,
                    D, sm, R)
     l4 = sprintf("err  %s%-9s%s %s(%d/%d bad)%s %sn%s %d/%d %selapsed%s %s",
                  ec, sprintf("%.1f%%", er), R, D, errs, m, R, D,R, m, win, D,R, clock(elapsed))
@@ -682,6 +683,17 @@ $1 == "TICK" { frame(); next }
   collect()
   if (sm > 0) { p50=pct(sbuf,sm,0.50); p95=pct(sbuf,sm,0.95); mx=pct(sbuf,sm,1.00) }
   else { p50=0; p95=0; mx=0 }
+  # Nearest rank ceil(0.95*m) equals m for every m below 20, so with fewer than
+  # twenty successful samples "p95" is simply the maximum wearing a percentile
+  # label. Every run opens on a connection handshake, which is the maximum, so
+  # the effect was a steady 16ms endpoint reporting p95 90.0ms for its first
+  # nineteen samples and then snapping to 16.8ms — the tool contradicting itself
+  # in the first twenty seconds of every run it is ever asked to do. The number
+  # is withheld until the rank can exclude something. On the split display max
+  # sits on the same row and is the honest name for what p95 would otherwise be
+  # showing; in plain mode there is no max column, so the aggregate is simply
+  # absent until it is real and each line still carries its own sample.
+  p95ok = (sm >= 20)
   wscale()
 
   if (tui) {
@@ -717,7 +729,8 @@ $1 == "TICK" { frame(); next }
   } else {
     printf "%s  HTTP %s%s%s  %s%-8s%s │ p95 %s%-8s%s  err %s%5.1f%%%s  n=%d\n", \
       $1, (bad?RED:""), code, (bad?R:""), col(ms,bad), fmt(ms), R, \
-      col(p95,0), (sm ? fmt(p95) : DASH), R, (er==0)?GRN:(er<5)?YEL:RED, er, R, m
+      (p95ok ? col(p95,0) : ""), (p95ok ? fmt(p95) : DASH), R, \
+      (er==0)?GRN:(er<5)?YEL:RED, er, R, m
   }
   fflush()
 }' < "$RUNDIR/stream" &

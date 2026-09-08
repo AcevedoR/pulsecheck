@@ -123,8 +123,13 @@ endpoint is; overrun slots are skipped, never queued.
 
 ## Caveats
 
-- **p95 is nearest-rank, not interpolated.** With `-w 20` the "p95" is just the
-  worst sample in the window. Use `-w 100` or more for the number to mean much.
+- **p95 is nearest-rank, not interpolated, and is withheld until it means
+  something.** Nearest rank `ceil(0.95*m)` equals `m` for any window under 20
+  samples, so below that "p95" would just be the maximum wearing a percentile
+  label — and since every run opens on a connection handshake, that maximum is
+  the handshake. It shows `—` until 20 *successful* samples are in the window;
+  `max` is on the same row meanwhile. A `-w` under 20 therefore never reports a
+  p95 at all, which is the honest outcome.
 - **A batch boundary costs a handshake**, once every `20 x --window` requests.
   Marked `⇄`, counted everywhere, excluded only from the drawing scale. It can
   move `max`, rarely p95.
