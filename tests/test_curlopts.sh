@@ -50,8 +50,13 @@ probe() {
     # An empty result is indistinguishable from a wrong one, and the reason is
     # on stderr. Surfacing it here puts it in the failure message instead of
     # leaving the next reader to guess from a CI log.
-    printf '(no output after %ss; stderr: %s)\n' "$((i / 10))" \
-      "$(tr '\n' ' ' < "$TMP/err" | cut -c1-300)"
+    # Distinguish the two ways this can be empty: the server never answered,
+    # or it answered and pulsecheck said nothing about it. One direct request
+    # settles which, and without it the next reader is where I was — guessing.
+    direct=$(curl -s -o /dev/null -m 3 -w '%{http_code}' "${@: -1}" 2>&1 || echo "curl-failed")
+    printf '(no output after %ss; stderr: %s; a direct curl to the same url got %s; %s curl procs alive)\n' \
+      "$((i / 10))" "$(tr '\n' ' ' < "$TMP/err" | cut -c1-200)" "$direct" \
+      "$(pgrep -c curl 2>/dev/null || echo 0)"
   fi
 }
 
