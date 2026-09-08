@@ -48,4 +48,25 @@ assigned |= set(re.findall(r'\(\s*([A-Za-z_]\w*)\s+in\s', prog))
 used = set(re.findall(r'\b([A-Za-z_]\w*)\b(?!\s*\()', prog))
 
 missing = sorted(used - AWK_KEYWORDS - defined - local - assigned - passed)
+
+# A parameter that shares a function's name shadows it for the whole body.
+# gawk and BWK awk allow it; mawk refuses the definition outright and then
+# reads the entire function body as top-level code, which is a wall of
+# unrelated syntax errors pointing nowhere near the actual mistake. Ours was a
+# summary function with a local called `line`, next to a function called
+# `line()`.
+shadow = []
+for f in re.finditer(r'function\s+(\w+)\s*\(([^)]*)\)', prog):
+    for a in f.group(2).split(','):
+        a = a.strip()
+        if a and a in defined:
+            shadow.append('%s() parameter %s shadows the function %s()' % (f.group(1), a, a))
+
+# Assigning to a function's name is the same mistake without the parameter
+# list: legal-looking, accepted by gawk and BWK awk, fatal in mawk.
+for a in sorted(assigned & defined):
+    shadow.append('%s is assigned to, but it is a function' % a)
+
+for s_ in shadow:
+    print(s_)
 print(' '.join(missing))
