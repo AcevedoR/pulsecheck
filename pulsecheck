@@ -1,0 +1,708 @@
+#!/usr/bin/env bash
+# pulsecheck — watch an HTTP endpoint's pulse: live latency with a rolling p95 and error rate.
+set -u
+
+VERSION=0.2.0
+WIN=60
+INT=1
+TMO=5
+EXPECT=200
+PLAIN=0
+WAVE=1
+DIAG=0
+RECORD=
+FRESH=0
+WHEN=auto      # --color: auto, always or never
+FRAME=0.1      # animation tick, seconds (10fps) — only when the wave is on
+HDR=5          # header lines held above the scroll region (6 with the wave)
+
+usage() {
+  cat <<'USAGE'
+pulsecheck — watch an HTTP endpoint's pulse.
+
+Usage:
+  pulsecheck [options] <url>
+
+Options:
+  -w, --window N     rolling window, in samples (default: 60)
+  -i, --interval S   seconds between requests (default: 1)
+  -t, --timeout S    per-request timeout, in seconds (default: 5)
+  -e, --expect CODE  HTTP status treated as success (default: 200)
+  -p, --plain        one self-contained line per sample, no fixed header
+      --fresh        a new connection per request (default: reuse one)
+      --color WHEN   auto, always or never (default: auto; NO_COLOR honoured)
+      --no-wave      drop the animated heartbeat trace from the header
+      --diag         print what the display detects about this terminal, exit
+      --record F     also write the raw display stream to F, for replay
+  -h, --help         show this help
+  -V, --version      show version
+
+On a terminal the display is split: a fixed header holds the URL, the probe
+settings, the rolling aggregates (last, p50, p95, max, error rate, elapsed) and
+a heartbeat trace of the window, with the requests listed underneath. The trace
+steps one column per request and a glint sweeps across it on every beat; pass
+--no-wave to drop it, and the ~10fps repaint that drives it.
+
+p50/p95/max and err are computed over the last N samples only, so a stall ages
+out of the window instead of skewing the numbers for the rest of the run. A
+request that times out or fails to connect is reported as HTTP 000 and counted
+as an error.
+
+By default one connection is reused for many requests, which is what a real
+client does, so what gets reported is the endpoint and not the handshake. A
+fresh TCP+TLS handshake per request costs more than many endpoints do: on one
+measured API, 53ms fresh against 16ms reused, 70% of it setup. --fresh restores
+a new connection per request, which is the right measurement when cold-connect
+cost is what you care about. The header always names the active mode, because
+otherwise the numbers are ambiguous.
+
+Latency aggregates cover successful requests only, and the header says how many
+that is. A refused connection returns in microseconds, so mixing failures in
+drags p95 DOWN exactly when things are worst. err% still covers every request.
+
+Colour and the split display are disabled automatically when stdout is not a
+terminal, or with --plain; each line then carries its own aggregates so the
+output stays greppable.
+
+Examples:
+  pulsecheck https://example.com
+  pulsecheck -w 300 https://example.com      # 5-minute window
+  pulsecheck -e 401 -i 0.5 https://api.example.com/me    # expect 401, 2 req/s
+  pulsecheck -p https://api.example.com | tee probe.log   # pipe-friendly
+  pulsecheck --fresh https://api.example.com/health      # include handshake cost
+USAGE
+}
+
+die() { printf 'pulsecheck: %s\n' "$1" >&2; exit 2; }
+
+URL=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -w|--window)   [ $# -ge 2 ] || die "$1 needs a value"; WIN=$2; shift 2 ;;
+    -i|--interval) [ $# -ge 2 ] || die "$1 needs a value"; INT=$2; shift 2 ;;
+    -t|--timeout)  [ $# -ge 2 ] || die "$1 needs a value"; TMO=$2; shift 2 ;;
+    -e|--expect)   [ $# -ge 2 ] || die "$1 needs a value"; EXPECT=$2; shift 2 ;;
+    -p|--plain)    PLAIN=1; shift ;;
+    --no-wave)     WAVE=0; shift ;;
+    --fresh)       FRESH=1; shift ;;
+    --color)       [ $# -ge 2 ] || die "$1 needs a value"; WHEN=$2; shift 2 ;;
+    --diag)        DIAG=1; shift ;;
+    --record)      [ $# -ge 2 ] || die "$1 needs a file"; RECORD=$2; shift 2 ;;
+    -h|--help)     usage; exit 0 ;;
+    -V|--version)  echo "pulsecheck $VERSION"; exit 0 ;;
+    -*)            die "unknown option: $1" ;;
+    *)             [ -z "$URL" ] || die "unexpected argument: $1"; URL=$1; shift ;;
+  esac
+done
+
+[ -n "$URL" ] || [ "$DIAG" = 1 ] || { usage >&2; exit 2; }
+[ -n "$URL" ] || URL=http://diag.invalid/
+case $WIN in ''|*[!0-9]*) die "--window must be a positive integer" ;; esac
+[ "$WIN" -gt 0 ] || die "--window must be a positive integer"
+command -v curl >/dev/null || die "curl not found"
+
+# --interval used to be taken on trust and only ever handed to `sleep`. The
+# pacing grid divides by it, so a bad value would now be a division by zero
+# inside the producer subshell — i.e. bash error text painted onto a terminal
+# awk owns, with no visible cause. Validate before anything can divide.
+case $INT in
+  ''|*[!0-9.]*|*.*.*) die "--interval must be a positive number" ;;
+esac
+
+# seconds (decimal string) -> integer milliseconds. bash 3.2 has no floats but
+# it has 64-bit ints; 10# defeats the octal reading of a leading zero, which is
+# how "059" from date +%N aborts a loop that looks perfectly correct.
+to_ms() {
+  _s=${1%%.*}
+  case $1 in *.*) _f=${1#*.}000 ;; *) _f=000 ;; esac
+  echo $(( 10#${_s:-0} * 1000 + 10#${_f:0:3} ))
+}
+# One date fork per sample sets the wall clock, the epoch and the millisecond
+# grid position together. awk has no systime() and curl has no wall-clock -w
+# variable, so in both modes the timestamp has to come from here.
+stamp() {
+  if [ "$NSOK" = 1 ]; then
+    _d=$(date '+%T %s %N')
+    CLK=${_d%% *}; _d=${_d#* }; SEC=${_d%% *}; NS=${_d##* }
+  else
+    _d=$(date '+%T %s')
+    CLK=${_d%% *}; SEC=${_d##* }; NS=000000000
+  fi
+  EPMS=$(( 10#$SEC * 1000 + 10#${NS:0:3} ))
+}
+
+IMS=$(to_ms "$INT")
+[ "$IMS" -gt 0 ] || die "--interval must be greater than zero"
+
+# Does this date support %N? It does on Darwin 25, but older BSD date emits a
+# literal "N" and $((10#N)) is a bash syntax error, not a zero. Probe once here
+# rather than discover it inside the loop. The awk side needs no probe: awk
+# coerces "1788804200.N" to 1788804200, i.e. it degrades to whole seconds.
+NSOK=1
+case $(date +%N 2>/dev/null) in ''|*[!0-9]*) NSOK=0 ;; esac
+
+# Reuse mode needs curl to pace a multi-url transfer, which is --rate (curl
+# 7.84+). Probe the capability rather than parsing "curl 8.7.1 (x86_64-apple-
+# darwin25.0)" and its vendor suffixes: one fork, and it cannot be wrong.
+MODE=reuse; MODENOTE=
+[ "$FRESH" = 0 ] || MODE=fresh
+if [ "$MODE" = reuse ] && ! curl --rate 1/s --help >/dev/null 2>&1; then
+  # Without --rate there is no way to pace a multi-url curl, and an unpaced one
+  # would hammer the endpoint. Fall back quietly in behaviour but loudly in the
+  # header: that line is the only place a user can learn they asked for reuse
+  # and did not get it.
+  MODE=fresh; MODENOTE=" · no --rate"
+fi
+
+# Requests per DAY, so any interval is expressible: curl takes an integer with a
+# unit, and /d gives about 12us of granularity where /s could only do seconds.
+RATE=$(( 86400000 / IMS ))
+[ "$RATE" -ge 1 ] || RATE=1
+# One batch is one connection. At 20x the window, a reconnect sample is inside
+# the rolling window only WIN/BATCH = 5% of the time and is 1/WIN = 1.7% of it
+# when it is — below the 5% p95 can see, so a boundary handshake can move max
+# and never p95. Clamped because 20*WIN alone is silly at both extremes.
+BATCH=$(( 20 * WIN ))
+[ "$BATCH" -ge 256 ] || BATCH=256
+[ "$BATCH" -le 4096 ] || BATCH=4096
+
+# NO_COLOR (any non-empty value) is a de-facto standard and costs nothing to
+# honour; an explicit --color beats it in either direction.
+case $WHEN in
+  auto|always|never) ;;
+  *) die "--color must be auto, always or never" ;;
+esac
+COLOR=0
+[ -t 1 ] && COLOR=1
+[ -z "${NO_COLOR:-}" ] || COLOR=0
+[ "$WHEN" = always ] && COLOR=1
+[ "$WHEN" = never ] && COLOR=0
+
+# Split display needs a terminal and a size we can trust. Getting the size right
+# is fiddlier than it looks:
+#   * inside `$(...)` stdout is a pipe, so ncurses looks at *stderr* to find the
+#     terminal — `tput cols 2>/dev/null` therefore silently returns terminfo's
+#     80x24 default instead of the real size;
+#   * `stty size` reports what the kernel was told the pty is, which is not
+#     always what the emulator is actually showing.
+# So the terminal is asked directly first: park the cursor far past the bottom
+# right, and DSR (ESC[6n) reports where it actually ended up, which is the real
+# grid. stty and tput remain fallbacks.
+DSR_ROWS=; DSR_COLS=
+probe_dsr() {
+  [ -t 1 ] || return 1
+  OLDSTTY=$(stty -g 2>/dev/null </dev/tty) || return 1
+  stty raw -echo 2>/dev/null </dev/tty || return 1
+  printf '\033[9999;9999H\033[6n' >/dev/tty 2>/dev/null
+  RESP=
+  IFS= read -r -d R -t 1 RESP 2>/dev/null </dev/tty
+  stty "$OLDSTTY" 2>/dev/null </dev/tty
+  RESP=${RESP#*[}                                   # strip ESC [
+  DSR_ROWS=${RESP%%;*}
+  DSR_COLS=${RESP#*;}
+  case $DSR_ROWS in ''|*[!0-9]*) return 1 ;; esac
+  case $DSR_COLS in ''|*[!0-9]*) return 1 ;; esac
+  [ "$DSR_ROWS" -gt 0 ] && [ "$DSR_COLS" -gt 0 ]
+}
+
+COLS=80; ROWS=24; SRC=default
+TUI=0
+if [ "$COLOR" = 1 ] && { [ "$PLAIN" = 0 ] || [ "$DIAG" = 1 ]; }; then
+  if probe_dsr; then
+    ROWS=$DSR_ROWS; COLS=$DSR_COLS; SRC=DSR; TUI=1
+    printf '\r'
+  else
+    SIZE=$(stty size 2>/dev/null </dev/tty)
+    case $SIZE in
+      [0-9]*' '[0-9]*) ROWS=${SIZE%% *}; COLS=${SIZE##* }; SRC="stty size"; TUI=1 ;;
+      *) if command -v tput >/dev/null; then    # note: stderr left alone
+           ROWS=$(tput lines) && COLS=$(tput cols) && SRC=tput && TUI=1
+         fi ;;
+    esac
+  fi
+  case $ROWS in ''|*[!0-9]*) ROWS=24; TUI=0 ;; esac
+  case $COLS in ''|*[!0-9]*) COLS=80; TUI=0 ;; esac
+  [ "$ROWS" -ge $((HDR + 5)) ] || TUI=0
+  [ "$COLS" -ge 72 ] || TUI=0
+fi
+[ "$PLAIN" = 0 ] || TUI=0
+[ "$TUI" = 1 ] || WAVE=0
+[ "$WAVE" = 1 ] && HDR=8            # 4 stat rows + 3 trace rows + rule
+# a short terminal keeps the split display but loses the trace
+if [ "$TUI" = 1 ] && [ "$WAVE" = 1 ] && [ "$ROWS" -lt $((HDR + 5)) ]; then
+  WAVE=0; HDR=5
+fi
+[ "$TUI" = 1 ] && [ "$ROWS" -lt $((HDR + 5)) ] && TUI=0
+
+if [ "$DIAG" = 1 ]; then
+  printf 'TERM               : %s\n' "${TERM:-unset}"
+  if [ -t 1 ]; then ISTTY=yes; else ISTTY=no; fi   # must be tested outside $()
+  printf 'stdout is a tty    : %s\n' "$ISTTY"
+  printf 'stty size </dev/tty: %s\n' "$(stty size 2>&1 </dev/tty)"
+  printf 'tput lines/cols    : %s/%s\n' "$(tput lines 2>&1)" "$(tput cols 2>&1)"
+  printf 'LINES/COLUMNS env  : %s/%s\n' "${LINES:-unset}" "${COLUMNS:-unset}"
+  printf 'DSR (ESC[6n) reply : %s x %s\n' "${DSR_ROWS:-none}" "${DSR_COLS:-none}"
+  printf 'chosen ROWS x COLS : %s x %s   (from %s)\n' "$ROWS" "$COLS" "$SRC"
+  printf 'split display (TUI): %s\n' "$TUI"
+  printf 'wave / header rows : %s / %s\n' "$WAVE" "$HDR"
+  printf 'list area          : rows %s to %s  (%s list rows)\n' \
+    "$((HDR + 1))" "$ROWS" "$((ROWS - HDR))"
+  exit 0
+fi
+
+# One directory per run holds the fifos, the curl config and the pid files. It
+# is created before the display is touched, so a failure here cannot leave a
+# half-configured terminal behind.
+RUNDIR=$(mktemp -d "${TMPDIR:-/tmp}/pulsecheck.XXXXXX") || die "cannot create a run directory"
+mkfifo "$RUNDIR/stream" || die "cannot create a pipe in $RUNDIR"
+if [ "$MODE" = reuse ]; then
+  mkfifo "$RUNDIR/w" || die "cannot create a pipe in $RUNDIR"
+  # Paired url/output entries, written once and reused for every batch. A bare
+  # -o /dev/null on the command line applies only to the FIRST url, so every
+  # other response body would land on stdout and corrupt the stream awk reads.
+  # Verified: without the pairing, bodies leak.
+  bi=0
+  while [ "$bi" -lt "$BATCH" ]; do
+    printf 'url = "%s"\noutput = "/dev/null"\n' "$URL"
+    bi=$(( bi + 1 ))
+  done > "$RUNDIR/urls"
+fi
+
+RESTORED=0
+cleanup() {
+  [ "$TUI" = 1 ] || return 0
+  [ "$RESTORED" = 0 ] || return 0
+  RESTORED=1
+  # Unhide the cursor, drop any region, and park on the last row after clearing
+  # it — the shell prompt then lands there and the rest of the final frame stays
+  # on screen. A newline here would scroll everything up by one and push the
+  # header off the top, which is exactly the state you want to keep.
+  printf '\033[r\033[?25h\033[%d;1H\033[K' "$ROWS"
+}
+PIPE=
+PROD=
+# The probe runs as background jobs and the script waits on them, rather than in
+# the foreground: bash defers a trap until the foreground command returns, so a
+# plain `kill` on this script would otherwise never run cleanup and would leave
+# the terminal with a scroll region set. `wait` is interruptible by a trap, so
+# the handler runs immediately either way.
+#
+# Every pid is tracked explicitly rather than relying on SIGPIPE. That worked
+# when the producer wrote once per interval and died at its next write, but a
+# reused connection means one long-lived curl holding an open socket, so a
+# SIGPIPE can arrive an interval late or not at all.
+stop() {
+  # The sentinel closes a race the kills cannot: the producer relaunches curl
+  # whenever its reader sees EOF, so killing curl alone can start a new batch.
+  # Both mechanisms, because either one alone leaves a window.
+  [ -z "$RUNDIR" ] || : > "$RUNDIR/stop" 2>/dev/null
+  [ -z "$PROD" ] || kill "$PROD" 2>/dev/null
+  if [ -n "$RUNDIR" ] && [ -f "$RUNDIR/curl.pid" ]; then
+    kill "$(cat "$RUNDIR/curl.pid" 2>/dev/null)" 2>/dev/null
+  fi
+  if [ -n "$RUNDIR" ] && [ -f "$RUNDIR/ticker.pid" ]; then
+    kill "$(cat "$RUNDIR/ticker.pid" 2>/dev/null)" 2>/dev/null
+  fi
+  # awk last: it is the only writer to the terminal, so it outlives what feeds it.
+  [ -z "$PIPE" ] || kill "$PIPE" 2>/dev/null
+  cleanup
+  [ -z "$RUNDIR" ] || rm -rf "$RUNDIR" 2>/dev/null
+}
+trap 'stop' EXIT
+trap 'stop; exit 130' INT TERM
+
+# Duplicate everything drawn from here on into the recording file. Placed after
+# the geometry probes so it cannot change what they see.
+[ -z "$RECORD" ] || exec > >(tee "$RECORD")
+
+if [ "$TUI" = 1 ]; then
+  # Reset any scroll region a previous run may have left, clear, hide cursor.
+  # No region is set: the list is repainted row by row (see the awk program), so
+  # the only terminal features relied on are cursor addressing and erase-to-EOL.
+  printf '\033[r\033[2J\033[H\033[?25l'
+fi
+
+# Samples and animation frames share one stdin: awk owns the screen, so it has
+# to be the only writer. Each printf is a single short write, well under
+# PIPE_BUF, so the two streams interleave without tearing a line.
+# awk is started first and reads the fifo; the producer writes to it. They are
+# two separately tracked background jobs rather than a pipeline, because bash
+# 3.2 cannot report the pid of a pipeline element that is not the last, and
+# teardown now has to kill the producer by pid instead of waiting for a
+# SIGPIPE that a long-lived curl can delay past the end of the run.
+awk -v win="$WIN" -v color="$COLOR" -v expect="$EXPECT" \
+           -v tui="$TUI" -v cols="$COLS" -v rows="$ROWS" -v hdr="$HDR" -v url="$URL" \
+           -v ivl="$INT" -v tmo="$TMO" -v ver="$VERSION" \
+           -v wv="$WAVE" -v frm="$FRAME" -v nsok="$NSOK" \
+           -v mode="$MODE" -v modenote="$MODENOTE" '
+BEGIN {
+  if (color) {
+    R="\033[0m"; B="\033[1m"; D="\033[2m"
+    GRN="\033[32m"; YEL="\033[33m"; ORG="\033[38;5;208m"; RED="\033[31m"
+    WHT="\033[97m"
+  }
+  # eight-step ramp, two steps per decade — substr() is byte-based in BWK awk,
+  # so the glyphs have to live in an array rather than one string
+  BL[1]="▁"; BL[2]="▂"; BL[3]="▃"; BL[4]="▄"
+  BL[5]="▅"; BL[6]="▆"; BL[7]="▇"; BL[8]="█"
+  BAD="╳"
+  L = rows - hdr                                  # visible list rows
+  ln = 0                                          # how many are in use
+  barw = cols - 34                                # bar must not wrap the line
+  if (barw > 24) barw = 24
+  if (barw < 8)  barw = 8
+  ww = cols - 14                                  # one column per sample, plus
+  if (ww < 20) ww = 20                            # room for the axis labels
+  # The glint crosses the trace in one beat, so it arrives at the right edge
+  # just as the next sample lands. Clamped so a very fast or very slow interval
+  # still sweeps at a watchable speed.
+  SHF = int(ivl/frm)
+  if (SHF < 4) SHF = 4; if (SHF > 40) SHF = 40
+  DASH="—"
+  rule=""; for (i=0;i<cols-1;i++) rule=rule "─"
+  urlw = cols - 14                                # room for "pulsecheck X.Y.Z "
+  if (urlw < 20) urlw = 20
+  shorturl = (length(url) > urlw) ? substr(url,1,urlw-1) "…" : url
+  header()
+}
+# Tuned for an HTTP endpoint over a network: 53ms is a healthy API, not a
+# warning. The old 10/50/500 boundaries were localhost numbers and painted an
+# entire healthy screen orange.
+function col(ms,bad) { return bad?RED:(ms<100)?GRN:(ms<300)?YEL:(ms<1000)?ORG:RED }
+# Aggregate latency spans successful and failed requests, and a refused
+# connection returns in microseconds — so a window with errors in it must not
+# paint its percentiles reassuringly green. Thresholds apply only to a clean
+# window; otherwise the numbers are shown uncoloured and err carries the signal.
+# Successful latencies only, gathered from the ring at aggregate time. A refused
+# connection returns in microseconds, so a window with failures in it used to
+# drag p95 DOWN exactly when things were worst — the aggregates said the
+# endpoint got faster as it went down. Walking the ring once here keeps one ring
+# and one index, so none of the display invariants move.
+function collect(   j) {
+  sm = 0
+  for (j=1;j<=m;j++) if (!ebuf[j]) { sm++; sbuf[sm] = buf[j] }
+}
+function fmt(ms) { return (ms<1000)?sprintf("%.1fms",ms):sprintf("%.2fs",ms/1000) }
+function pct(a,m,p,   b,i,j,v,k) {
+  for (i=1;i<=m;i++) b[i]=a[i]
+  for (i=2;i<=m;i++) { v=b[i]; for (j=i-1;j>=1 && b[j]>v;j--) b[j+1]=b[j]; b[j+1]=v }
+  k=int(p*m); if (k<p*m) k++                      # nearest-rank = ceil(p*m)
+  if (k<1) k=1; if (k>m) k=m
+  return b[k]
+}
+# The trace auto-scales to the window: a healthy endpoint sitting at 51-58ms
+# would otherwise draw one flat line, which is what made the first version look
+# like a solid bar. The scale is printed at both ends of the axis so the shape
+# cannot be read as more dramatic than it is, and the colour still comes from
+# the absolute thresholds — so a lively waveform in green stays legible as
+# "moving around, but healthy".
+function wscale(   i,k,j,v,off,cnt,lo,hi,sok) {
+  off = (wn > ww) ? wn - ww : 0
+  # Count the successes in view first: the scale follows ok traffic, because
+  # that shape appears nowhere else on screen and it makes the trace axis agree
+  # with the header instead of contradicting it. Below two successes there is no
+  # ok shape to draw, so everything is included rather than rendering an empty
+  # trace during an outage.
+  # Count the ordinary successes in view: not failures, and not the samples that
+  # paid for a handshake. A run starts with a reconnect by definition, and at
+  # -i 0.5 that one sample would otherwise own the scale for the first thirty
+  # seconds — flattening a healthy 15ms baseline onto the bottom row, which is
+  # the same "one outlier hides all the shape" bug that min/max scaling had.
+  # The sample is still in every statistic and still marked in its list row;
+  # it is only the drawing scale that ignores it.
+  sok = 0
+  for (i=1;i<=ww;i++) {
+    k = off + i
+    if (k > wn) break
+    j = ((k-1) % ww) + 1
+    if (!wbad[j] && !wcon[j]) sok++
+  }
+  cnt = 0; lo = -1; hi = -1
+  for (i=1;i<=ww;i++) {
+    k = off + i
+    if (k > wn) break
+    j = ((k-1) % ww) + 1
+    if ((wbad[j] || wcon[j]) && sok >= 2) continue  # ordinary traffic only, once
+    v = wms[j]; cnt++; tmp[cnt] = v                 # there is enough of it to
+    if (lo < 0 || v < lo) lo = v                    # have a shape at all
+    if (v > hi) hi = v
+  }
+  if (cnt == 0) { wlo = 0; whi = 0; flat = 1; clipt = 0; clipb = 0; return }
+  # Scale between the 5th and 95th percentile, not between min and max. One
+  # 320ms spike against a 50ms baseline flattens every other sample onto the
+  # bottom row, and one microsecond-fast connection refusal does the same from
+  # below — that is how the first version drew a healthy endpoint as a single
+  # straight line. Samples outside the band clip, and the axis says so.
+  wlo = pct(tmp, cnt, 0.05)
+  whi = pct(tmp, cnt, 0.95)
+  clipt = (hi > whi); clipb = (lo < wlo)
+  # Below either bound there is nothing to show: auto-scaling a sub-percent
+  # spread would turn measurement noise into a dramatic waveform.
+  flat = (whi - wlo < 0.05) || (whi - wlo < 0.02*wlo)
+}
+function wlevel(ms,   l) {
+  if (flat) return 12
+  l = 1 + int(23*(ms-wlo)/(whi-wlo))
+  if (l < 1) l = 1; if (l > 24) l = 24
+  return l
+}
+# Three rows of eight block steps give 24 levels of vertical resolution; row 1
+# is the bottom. A failed request is drawn at its measured height in red — a
+# refusal that returned in microseconds is a red notch at the floor, a slow 503
+# is a tall red column, and those are different facts worth telling apart.
+function wave3(   i,k,j,off,newest,lvl,dist,c,g,r,base) {
+  off = (wn > ww) ? wn - ww : 0
+  newest = wn - off
+  # The glint sweeps only the columns that hold samples, so it does not spend
+  # most of its travel over an empty tail while the window fills. Without this
+  # assignment spos stays 0 and columns 1 and 2 are lit forever, which is a
+  # stationary smudge rather than a sweep.
+  spos = (f <= SHF) ? int(newest*f/SHF) + 1 : -99
+  for (r=1;r<=3;r++) { wrow[r]=""; wpc[r]="none" }
+  for (i=1;i<=ww;i++) {
+    k = off + i
+    if (k > wn) {
+      for (r=1;r<=3;r++) wrow[r] = wrow[r] " "
+      continue
+    }
+    j = ((k-1) % ww) + 1
+    lvl = wlevel(wms[j])
+    c = wbad[j] ? RED : col(wms[j],0)
+    dist = i - spos; if (dist < 0) dist = -dist
+    if (i == newest && f <= 2) c = B WHT
+    else if (dist == 0)        c = B WHT
+    else if (dist <= 2)        c = B c
+    for (r=1;r<=3;r++) {
+      base = (r-1)*8
+      if (lvl >= base+8)   g = BL[8]
+      else if (lvl > base) g = BL[lvl-base]
+      else                 g = ""
+      if (g == "") { wrow[r] = wrow[r] " "; continue }
+      if (c != wpc[r]) { wrow[r] = wrow[r] R c; wpc[r] = c }
+      wrow[r] = wrow[r] g
+    }
+  }
+  for (r=1;r<=3;r++) wrow[r] = wrow[r] R
+  wrow[3] = wrow[3] sprintf(" %s┤%s %s%-9s%s", D, R, D, \
+    (wn ? fmt(whi) (clipt ? "+" : "") : ""), R)
+  wrow[1] = wrow[1] sprintf(" %s┤%s %s%-9s%s", D, R, D, \
+    (wn ? fmt(wlo) (clipb ? "-" : "") : ""), R)
+  wrow[2] = wrow[2] sprintf(" %s┤%s", D, R)
+}
+function clock(s,   h,mi) { h=int(s/3600); mi=int((s%3600)/60); return sprintf("%02d:%02d:%02d",h,mi,s%60) }
+# Seconds as a duration, matching clock() above rather than fmt(): 29.5s, 3:07.
+function span_s(s) { return (s<60) ? sprintf("%.1fs", s) : sprintf("%d:%02d", int(s/60), s%60) }
+function rep(c,k,   s,i) { s=""; for (i=0;i<k;i++) s=s c; return s }
+function line(row,s) { printf "\033[%d;1H\033[K%s", row, s }
+# The header is repainted in place on every sample: save the cursor, address the
+# rows above the scroll region absolutely, restore. Never emits a newline, so it
+# cannot scroll the list underneath.
+function header(   l1,l2,l3,l4,ec) {
+  if (!tui) return
+  # The mode belongs on the URL row because it qualifies every number below it:
+  # reuse reports the endpoint, fresh reports endpoint plus handshake, and the
+  # two differ by more than most endpoints cost. When the server closes every
+  # connection, reuse was asked for and not granted, so say what is actually
+  # happening rather than what was requested.
+  modetxt = mode
+  if (mode == "reuse" && m >= 4 && recon > m/2) modetxt = "reuse · server closes"
+  l1 = sprintf("%spulsecheck%s %s%s%s %s %s· %s%s%s", B, R, D, ver, R, shorturl, \
+               D, modetxt, modenote, R)
+  # "window 60 samples" is the clause that implies a duration without stating
+  # one, so the real span replaces its tail rather than being appended as a new
+  # clause elsewhere. Yellow only when the measured cadence has slipped past
+  # 10% of --interval, so the common case stays as dim as the rest of the row.
+  cad  = (m>1) ? span/(m-1) : 0
+  slip = (m>1) && (cad > 1.10*ivl)
+  wintxt  = (m>0 && m<win) ? sprintf("%d/%d samples", m, win) : sprintf("%d samples", win)
+  spantxt = (m>1) ? span_s(span) : DASH
+  # The per-sample cadence needs sub-second timestamps to be worth printing, and
+  # it needs 78 columns; the split display only guarantees 71.
+  if (slip && nsok && cols >= 80) spantxt = spantxt sprintf(" (%s/sample)", span_s(cad))
+  l2 = sprintf("%sexpect %s · every %ss · timeout %ss · window %s / %s%s%s", \
+               D, expect, ivl, tmo, wintxt, (slip ? R YEL : ""), spantxt, R)
+  if (n == 0) {
+    l3 = sprintf("last %-9s %sp50%s %-9s %sp95%s %-9s %smax%s %s", DASH, D,R, DASH, D,R, DASH, D,R, DASH)
+    l4 = sprintf("err  %-9s %sn%s 0/%d", DASH, D,R, win)
+  } else {
+    ec = (er==0)?GRN:(er<5)?YEL:RED
+    # With no successful sample in the window there is nothing to average, and
+    # printing a number computed from failures would be the exact lie this
+    # change exists to remove. Absence is the honest rendering.
+    if (sm == 0)
+      l3 = sprintf("last %s%-9s%s %sp50%s %-9s %sp95%s %-9s %smax%s %-9s %sover 0 ok%s",
+                   col(ms,bad), fmt(ms), R, D,R, DASH, D,R, DASH, D,R, DASH, D, R)
+    else
+      l3 = sprintf("last %s%-9s%s %sp50%s %s%-9s%s %sp95%s %s%-9s%s %smax%s %s%-9s%s %sover %d ok%s",
+                   col(ms,bad), fmt(ms), R, D,R, col(p50,0), fmt(p50), R,
+                   D,R, col(p95,0), fmt(p95), R, D,R, col(mx,0), fmt(mx), R,
+                   D, sm, R)
+    l4 = sprintf("err  %s%-9s%s %s(%d/%d bad)%s %sn%s %d/%d %selapsed%s %s",
+                 ec, sprintf("%.1f%%", er), R, D, errs, m, R, D,R, m, win, D,R, clock(elapsed))
+  }
+  line(1, l1); line(2, l2); line(3, l3); line(4, l4)
+  if (wv) { wave3(); line(5, wrow[3]); line(6, wrow[2]); line(7, wrow[1]) }
+  line(hdr, D rule R)
+  fflush()
+}
+# A frame repaints the trace and nothing else.
+function frame() {
+  if (!tui || !wv) return
+  f++
+  wave3(); line(5, wrow[3]); line(6, wrow[2]); line(7, wrow[1])
+  fflush()
+}
+$1 == "TICK" { frame(); next }
+{
+  if (!t0) t0 = $2
+  elapsed = $2 - t0
+  code=$3; ms=$4*1000; bad=(code!=expect)
+  cn=$5+0
+  i=(n%win)+1; buf[i]=ms; ebuf[i]=bad; tbuf[i]=$2; cbuf[i]=cn; n++
+  j=(wn%ww)+1; wms[j]=ms; wbad[j]=bad; wcon[j]=cn; wn++
+  f=0                                             # every beat restarts the glint
+  m=(n<win)?n:win
+  # How much wall time the stat window actually covers. Evaluated AFTER n++, so
+  # (n%win)+1 is the slot about to be overwritten next, which is the oldest one
+  # still live. Getting this before the increment is off by one and only shows
+  # up at the single moment the ring first wraps. The span covers successes and
+  # failures alike: it is a time span, not a latency statistic, and dropping
+  # failures would make it lie in exactly the case it exists to describe.
+  oi = (n<=win) ? 1 : (n%win)+1
+  span = (m>1) ? $2 - tbuf[oi] : 0
+  errs=0; recon=0
+  for (j=1;j<=m;j++) { errs+=ebuf[j]; recon+=(cbuf[j]>0) }
+  er=100*errs/m
+  # err% covers every request; the latency aggregates cover the successful ones.
+  # Those are different questions and the header now says which is which.
+  collect()
+  if (sm > 0) { p50=pct(sbuf,sm,0.50); p95=pct(sbuf,sm,0.95); mx=pct(sbuf,sm,1.00) }
+  else { p50=0; p95=0; mx=0 }
+  wscale()
+
+  if (tui) {
+    # the list carries only this request; the aggregates live in the header
+    # The bar is scaled to the window, not to an absolute decade scale. An
+    # absolute log bar drew 51ms and 58ms at exactly the same width, so a
+    # healthy run was a wall of identical lines carrying no information. Scaled
+    # to the window, the bar shows where this request sits among its neighbours,
+    # and the header plus the trace axis carry the absolute numbers.
+    # Failures are scaled like anything else rather than forced to full width:
+    # a 1.2s 503 and a 0.2ms refusal are very different facts, and the red
+    # status code already makes the failure impossible to miss.
+    bw = flat ? int(barw/2) : 1 + int((barw-1)*(ms-wlo)/(whi-wlo))   # same scale
+    if (bw < 1) bw = 1
+    if (bw > barw) bw = barw
+    # "HTTP" on every row is noise, and so is a status that never changes: the
+    # expected code is dimmed so only the failures catch the eye.
+    # A reconnect costs a handshake its neighbours did not pay, so its row would
+    # otherwise be an unexplained tall bar in a field of short ones. One dim
+    # glyph is cheaper than leaving the user to guess. Only meaningful in reuse
+    # mode: in fresh mode every request reconnects, so the producer sends 0.
+    mk = (cn > 0) ? D "⇄" R : " "
+    txt = sprintf("%s%s%s %s %s%s%s  %s%8s%s  %s%s%s", \
+      D, $1, R, mk, (bad ? RED B : D), code, R, \
+      col(ms,bad), fmt(ms), R, col(ms,bad), rep("█",bw), R)
+    if (ln < L) { ln++; lb[ln] = txt; line(hdr + ln, txt) }
+    else {
+      for (k = 1; k < L; k++) lb[k] = lb[k+1]
+      lb[L] = txt
+      for (k = 1; k <= L; k++) line(hdr + k, lb[k])
+    }
+    header()
+  } else {
+    printf "%s  HTTP %s%s%s  %s%-8s%s │ p95 %s%-8s%s  err %s%5.1f%%%s  n=%d\n", \
+      $1, (bad?RED:""), code, (bad?R:""), col(ms,bad), fmt(ms), R, \
+      col(p95,0), (sm ? fmt(p95) : DASH), R, (er==0)?GRN:(er<5)?YEL:RED, er, R, m
+  }
+  fflush()
+}' < "$RUNDIR/stream" &
+PIPE=$!
+
+{
+  if [ "$WAVE" = 1 ]; then
+    while :; do printf 'TICK\n'; sleep "$FRAME"; done &
+    TICKER=$!
+    echo "$TICKER" > "$RUNDIR/ticker.pid"
+    trap 'kill $TICKER 2>/dev/null' EXIT
+  fi
+  # Pacing is against an ABSOLUTE grid: sample n is due at T0 + n*interval.
+  # Sleeping the full interval after each request measured +16.7% at -i 0.5 and
+  # +92% against a 0.9s endpoint, because the request and the forks around it
+  # are added to every period. Sleeping interval-minus-time_total still runs
+  # +5.4%: it cannot see its own fork cost, so it is systematically late and the
+  # error accumulates forever. The grid bounds the drift at sleep granularity.
+  SEQ=0; T0=
+  if [ "$MODE" = reuse ]; then
+    # ONE curl per batch, holding one connection for BATCH requests. Measured on
+    # a real API: 53ms per request with a fresh process against 16ms once the
+    # connection is reused, so about 70% of what the old loop called latency was
+    # handshake. curl paces within the batch via --rate; the grid below paces
+    # between batches, because --rate fires the first request of a new batch
+    # immediately (measured 0.07s gap, against 0.52s with the grid).
+    LASTMS=0
+    while :; do
+      [ -e "$RUNDIR/stop" ] && break
+      # -w goes to STDERR deliberately: curl block-buffers -w through a pipe and
+      # delivers a whole batch at exit, which would freeze the display and then
+      # dump it. stderr is unbuffered and streams line by line. -N does not
+      # help, and a bare %stderr form prints literally.
+      curl -s -K "$RUNDIR/urls" --rate "${RATE}/d" -m "$TMO" \
+        -w '%{stderr}%{http_code} %{time_total} %{num_connects}\n' \
+        2>"$RUNDIR/w" >/dev/null &
+      echo $! > "$RUNDIR/curl.pid"
+      while IFS= read -r L; do
+        stamp
+        # Stamped at completion, not at start: curl never reports a request
+        # start, and completion is the instant --rate itself paces on.
+        printf '%s %s.%s %s\n' "$CLK" "$SEC" "${NS:0:6}" "$L"
+        [ -n "$T0" ] || T0=$EPMS
+        SEQ=$(( SEQ + 1 ))
+        LASTMS=$EPMS
+      done < "$RUNDIR/w"
+      wait 2>/dev/null
+      [ -e "$RUNDIR/stop" ] && break
+      # Re-anchor to the grid before relaunching, so per-batch drift cannot
+      # accumulate across the run.
+      [ -n "$T0" ] || T0=$LASTMS
+      K=$(( (LASTMS - T0) / IMS + 1 ))
+      [ "$K" -gt "$SEQ" ] || K=$SEQ
+      REM=$(( T0 + K * IMS - LASTMS ))
+      [ "$REM" -gt 0 ] && sleep "$(printf '%d.%03d' $((REM/1000)) $((REM%1000)))"
+      SEQ=$K
+    done
+  else
+    while :; do
+      stamp
+      OUT=$(curl -s -o /dev/null -m "$TMO" -w '%{http_code} %{time_total}' "$URL")
+      # 6 fractional digits, not 9: an IEEE double holds about 16 significant
+      # digits, so the last three would be lost silently. Truncating is plainer.
+      # The trailing 0 is field 5: in fresh mode every request pays for its own
+      # connection, so flagging them all would flag nothing. Field 5 means "this
+      # sample paid for a handshake its neighbours did not".
+      printf '%s %s.%s %s 0\n' "$CLK" "$SEC" "${NS:0:6}" "$OUT"
+
+      ELMS=$(to_ms "${OUT##* }")
+      NOWMS=$(( EPMS + ELMS ))                # end of the request, estimated
+
+      if [ "$NSOK" = 1 ]; then
+        [ -n "$T0" ] || T0=$EPMS
+        SEQ=$(( SEQ + 1 ))
+        # First slot strictly in the future. A request that overruns its slot
+        # SKIPS the missed ones; it never queues and never fires back to back,
+        # so a recovering endpoint cannot be turned into a burst load test.
+        K=$(( (NOWMS - T0) / IMS + 1 ))
+        [ "$K" -le "$SEQ" ] || SEQ=$K
+        REM=$(( T0 + SEQ * IMS - NOWMS ))
+      else
+        REM=$(( IMS - ELMS ))               # no sub-second clock for a grid
+      fi
+
+      [ "$REM" -gt 0 ] || REM=0
+      [ "$REM" -eq 0 ] || sleep "$(printf '%d.%03d' $((REM/1000)) $((REM%1000)))"
+    done
+  fi
+} > "$RUNDIR/stream" 2>/dev/null &
+PROD=$!
+
+wait "$PIPE"
