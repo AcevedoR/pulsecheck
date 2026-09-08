@@ -330,6 +330,17 @@ header off the top, discarding the final frame — which is the thing worth
 keeping after Ctrl-C. The alternate screen buffer was considered and rejected
 for the same reason: it would wipe the last numbers off the display on exit.
 
+**A whole feature that did nothing, silently:** the `--json` and `--summary`
+work was written, and its `-v` bindings were added to a line that existed only
+on a different branch. awk therefore saw `json`, `summary` and `rundir` as empty
+strings, took every false branch, and produced no JSON and no summary while
+exiting 0. Nothing warned — this is the fourth time an unbound awk variable has
+cost real time here, after the interval division by zero, the dead glint and the
+scale guard that never fired. `tests/test_static.sh` now compares the set of
+identifiers the awk program uses against the set it receives, and audits itself
+by deleting a binding it knows about and checking that it complains, because a
+silent audit is worse than none.
+
 **A number that was wrong on every run, for the first twenty seconds of it:**
 nearest rank `ceil(0.95*m)` equals `m` for every `m` below 20, so with a
 partially filled window "p95" was simply the maximum under another name. Every
@@ -485,9 +496,16 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
   very harness CI depends on), and enough to make the file unparseable to a
   POSIX shell. Still open: busybox awk, and bash 5.x is only covered
   incidentally by whatever Ubuntu ships.
-- `--json` line output, a summary on exit, and a non-zero exit when a threshold
-  was breached. Devs pipe things and gate CI on them; without this the tool
-  cannot participate in either.
+- ~~`--json`, a summary on exit, and a non-zero exit on a breached threshold~~
+  **DONE.** With `-c/--count`, which the rest depends on: a gate cannot deliver
+  a verdict on a run that never ends, so the thresholds refuse to start without
+  it rather than exiting 0 on a run that never reached one. Gates judge the
+  whole run rather than the last window, since a CI check asking "was this
+  healthy for the duration" must not be decided by the contents of a buffer at
+  an arbitrary moment. Run percentiles come from a reservoir of up to 10,000
+  successful samples (algorithm R, fixed seed so a run is reproducible) because
+  keeping every latency is unbounded — a day at one per second is 86,400 — and
+  the summary states the sample size rather than implying exactness.
 - `SIGWINCH` handling. A monitor that has to be restarted after a window resize
   reads as broken.
 - Multiple URLs in one process.

@@ -71,6 +71,11 @@ pulsecheck [options] <url>
   -e, --expect CODE  HTTP status treated as success (default: 200)
   -H, --header H     request header, repeatable ("Name: value")
   -p, --plain        one self-contained line per sample, no fixed header
+      --json         one JSON object per sample on stdout
+  -c, --count N      stop after N samples (default: run until interrupted)
+      --summary      print totals for the whole run when it stops
+      --fail-over MS exit 1 if the run p95 exceeds MS
+      --fail-err PCT exit 1 if the run error rate exceeds PCT
       --fresh        a new connection per request (default: reuse one)
       --color WHEN   auto, always or never (default: auto; NO_COLOR honoured)
       --no-wave      drop the animated heartbeat trace from the header
@@ -110,6 +115,39 @@ pulsecheck -H @auth.txt https://api.example.com/me
 Verified both ways: with `@auth.txt` the token appears in no process's argv;
 passed inline it appears in pulsecheck's own. Header values are never printed —
 the display shows only a count (`· 2 headers`).
+
+## Scripting and CI
+
+```sh
+pulsecheck --json -c 100 https://api.example.com/health | jq -c '{ms, p95}'
+pulsecheck -c 60 --summary https://api.example.com/health
+pulsecheck -c 60 --fail-over 250 --fail-err 1 https://api.example.com/health
+```
+
+`--json` prints one object per sample:
+
+```json
+{"t":"20:04:39","epoch":1788890679.279,"code":"200","ok":true,"ms":16.4,
+ "reconnect":false,"n":37,"p50":16.1,"p95":22.8,"max":91.2,"err_pct":0.0,
+ "ok_in_window":37,"window_s":18.4}
+```
+
+`p95` is `null` while the window is too small to rank one — a consumer can test
+for it, where a number would have silently been the maximum. `code` is a string
+because curl reports `"000"` when it never got a status at all.
+
+`-c/--count` gives the run an end, which is what makes the rest usable: a gate
+cannot deliver a verdict on a run that never stops, so `--fail-over` and
+`--fail-err` require it and say so rather than exiting 0 on a run that never
+reached one.
+
+Gates are judged on the **whole run**, not the last window — a CI check asking
+"was this endpoint healthy for the duration" must not be decided by whatever
+happened to be in the buffer when the run stopped. Percentiles over the run
+come from a uniform reservoir of up to 10,000 successful samples, and the
+summary says how many requests are behind them. Exit status: **0** healthy,
+**1** a gate was breached (including a p95 gate with too few successes to
+judge), **2** a usage error.
 
 ## What it measures
 
