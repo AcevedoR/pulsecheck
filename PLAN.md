@@ -1,7 +1,35 @@
 # pulsecheck — plan (draft)
 
 Status: **v0.3.0.** Published at github.com/AcevedoR/pulsecheck (public, MIT).
-Last updated: 2026-09-08
+Last updated: 2026-09-09
+
+**Merged so far** (all on `main`, all through PRs green on the full CI matrix):
+
+| date | PR | what |
+|---|---|---|
+| 09-07 | — | v0.2.0 initial publish: rolling window, split display, heartbeat trace |
+| 09-08 | #2 | `-H/--header`, via a private curl config file |
+| 09-08 | #3 | locale, geometry and `--record` portability, plus the CI matrix |
+| 09-08 | — | test suite and CI (yours, pushed direct to main) |
+| 09-08 | #4 | p95 withheld until its rank can exclude a sample |
+| 09-08 | #8 | `--json`, `-c/--count`, `--summary`, threshold exit codes |
+| 09-08 | #5 | `--head`, `--insecure`, `--resolve` |
+| 09-08 | #7 | animated SVG demo, `install.sh`, Homebrew formula |
+| 09-09 | #9 | Homebrew instructions corrected: no second repo needed |
+
+Test suite: **157 assertions** across eight suites (`static cli awk window json
+locale screen e2e curlopts`), green on ubuntu-latest x {mawk, gawk,
+original-awk} and macos-latest x BWK awk.
+
+**Next, in the order it matters** — reasoning in section 6:
+1. `SIGWINCH`: a resize still needs a restart, and resizing is the first thing
+   anyone does to a long-running monitor.
+2. Multiple URLs in one process.
+3. A tagged release, which is the only thing standing between the current
+   formula and a stable (non-HEAD) `brew install`. That one is a decision about
+   what to stamp, not work.
+4. busybox awk in the matrix, and bash 5.x deliberately rather than by
+   accident of whatever Ubuntu ships.
 
 ---
 
@@ -493,7 +521,8 @@ connection setup dominating the reported latency, a window that was not the
 duration it claimed, and percentiles contaminated by failures. All measured, all
 fixed, all recorded in section 4. Nothing else mattered until these did.
 
-**v0.3 — table stakes for a CLI other people run. IN PROGRESS.**
+**v0.3 — table stakes for a CLI other people run. LARGELY DONE**, everything
+below except SIGWINCH and multiple URLs.
 - ~~`-H/--header` pass-through~~ **DONE in 0.3.0.** Repeatable, and passed to
   curl through a config file in the 0700 run directory rather than on its
   command line, so a credential is not copied into the argv of every request
@@ -512,8 +541,9 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
   self-signed certificate. `--head` measures a different thing from a GET and
   the README says so; `--insecure` is rendered in yellow on the header, since
   not verifying a certificate qualifies every number underneath it.
-- ~~Portability and CI~~ **IN PROGRESS.** A suite exists (`tests/`, 127
-  assertions across cli, awk, locale, screen and e2e) and CI runs it on
+- ~~Portability and CI~~ **DONE, with two gaps named below.** A suite exists
+  (`tests/`, 157 assertions across static, cli, awk, window, json, locale,
+  screen, e2e and curlopts) and CI runs it on
   ubuntu-latest and macos-latest across mawk, gawk and BWK awk, with a
   comma-decimal locale installed so the locale regression has something to bite
   on. What that shook out is above: the locale bug, an unclamped geometry that
