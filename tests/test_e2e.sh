@@ -25,21 +25,25 @@ read -r PORT <&3 || true
 [ -n "$PORT" ] || { echo "server did not start" >&2; exit 1; }
 URL="http://127.0.0.1:$PORT/"
 
-# run_probe URL EXTRA... -> stdout of a short run
-# The run is bounded by the number of samples, not by a timer: pulsecheck runs
-# until killed, so the reader closes the pipe once it has enough lines.
+# run_probe URL EXTRA... -> stdout of a bounded run
+#
+# The run ends itself with --count. It used to be killed once the reader had
+# enough lines, which is what made these tests flaky: on one CI runner the
+# output never arrived at all, while the server logged the requests and a direct
+# curl to the same url answered 200 — the tool working and the harness unable to
+# see it. Killing the process under test races its own output; a run that exits
+# on its own has flushed and closed everything it owns first.
 run_probe() {
-  local out=$TMP/out
-  : > "$out"
-  ( ./pulsecheck -i 0.05 -t 2 "$@" >"$out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
-  local pid; pid=$(cat "$TMP/pid")
-  local i=0
-  while [ "$(wc -l < "$out")" -lt 3 ] && [ $i -lt 100 ]; do
-    sleep 0.1; i=$((i+1))
-  done
-  kill "$pid" 2>/dev/null
-  wait "$pid" 2>/dev/null
-  cat "$out"
+  : > "$TMP/out"
+  ./pulsecheck -p -i 0.05 -t 2 -c 3 "$@" > "$TMP/out" 2> "$TMP/err"
+  if [ -s "$TMP/out" ]; then
+    cat "$TMP/out"
+  else
+    # An empty result is indistinguishable from a wrong one, and the reason is
+    # on stderr. Put it in the failure message rather than leaving the next
+    # reader to guess from a CI log.
+    printf '(no output; stderr: %s)\n' "$(tr '\n' ' ' < "$TMP/err" | cut -c1-200)"
+  fi
 }
 
 echo "plain mode against a local server"

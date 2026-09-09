@@ -383,6 +383,13 @@ under test: with `--count` a run ends itself, having flushed and closed what it
 owns before the test reads a byte. That also took the suite from tens of
 seconds to about two.
 
+**And then it came back**, in a docs-only PR, because the fix was applied to one
+suite and not the other two. I had judged the rest "a follow-up, to keep the PR
+focused" — which is exactly the wrong call for a fix to a *pattern*: the flake
+lives wherever the pattern lives, and a docs change failing CI on one runner is
+what that costs. Every suite now bounds its run with `--count` and no test kills
+a probe.
+
 **Three harness failures that each looked like a bug in the program:**
 
 - SIGINT "did not terminate the script". It does, in 0.01s. The first harness
