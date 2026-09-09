@@ -57,12 +57,10 @@ else
   read -r PORT <&3 || true
   [ -n "${PORT:-}" ] || { echo "  server did not start" >&2; exit 1; }
 
-  ( LC_ALL=$LOC ./pulsecheck -p -i 0.05 -t 2 "http://127.0.0.1:$PORT/" \
-      > "$TMP/out" 2>"$TMP/err" & echo $! > "$TMP/pid" )
-  pid=$(cat "$TMP/pid")
-  i=0
-  while [ "$(wc -l < "$TMP/out")" -lt 3 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
-  kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+  # Bounded with --count and left to exit on its own: killing the process under
+  # test races its own output, which is what made the other suites flaky.
+  LC_ALL=$LOC ./pulsecheck -p -i 0.05 -t 2 -c 3 "http://127.0.0.1:$PORT/" \
+    > "$TMP/out" 2>"$TMP/err"
 
   line=$(head -1 "$TMP/out")
   # A dot, not a comma, and a latency that is not zero: both halves of the bug.
