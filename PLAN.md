@@ -535,10 +535,19 @@ fixed, all recorded in section 4. Nothing else mattered until these did.
   downloaded is the script — shebang, version line, `bash -n` — before putting
   it on a PATH. A proxy error page installed as a program is a worse outcome
   than a failed install.
-- ~~Homebrew~~ **PARTLY.** `Formula/pulsecheck.rb` is HEAD-only and installable
-  by URL; a stable `url`/`sha256` block wants a tagged release, and
-  `brew install AcevedoR/pulsecheck/pulsecheck` wants a second repository named
-  `homebrew-pulsecheck`. Both are decisions rather than work.
+- ~~Homebrew~~ **DONE for HEAD installs.** `Formula/pulsecheck.rb` installs
+  either by URL (`brew install --HEAD <raw url>`) or by tapping this repository
+  with the two-argument form, `brew tap AcevedoR/pulsecheck <url>`. An earlier
+  note here claimed a tap needs a second repository called
+  `homebrew-pulsecheck`; that is wrong, and worth correcting rather than
+  quietly deleting. Homebrew's `homebrew-` prefix names the **local** directory
+  it clones into — `brew tap` with an explicit URL clones any remote, whatever
+  it is called, which its own help spells out: "This two-argument command makes
+  no assumptions." The second repository buys exactly one thing, the
+  one-argument shortcut, so a stranger can type
+  `brew install AcevedoR/pulsecheck/pulsecheck` cold without tapping first.
+  Still outstanding and genuinely separate: a stable (non-HEAD) formula needs a
+  tagged release to hang a `url` and `sha256` on.
 - A man page.
 - ~~A moving demo at the top of the README~~ **DONE**, though not with
   asciinema. `tools/svgcast.py` replays a `--record` capture into an animated
