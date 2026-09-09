@@ -73,11 +73,25 @@ The installer checks that what it downloaded is actually the script — a sheban
 a version line, and `bash -n` — before putting it on your PATH, because a proxy
 error page installed as a program is a worse outcome than a failed install.
 
-With Homebrew:
+With Homebrew, either directly from the formula:
 
 ```sh
 brew install --HEAD https://raw.githubusercontent.com/AcevedoR/pulsecheck/main/Formula/pulsecheck.rb
 ```
+
+or by tapping this repository, which needs no separate tap repo — the
+`homebrew-` prefix in Homebrew's convention names the *local* directory it
+clones into, not the remote:
+
+```sh
+brew tap AcevedoR/pulsecheck https://github.com/AcevedoR/pulsecheck
+brew install AcevedoR/pulsecheck/pulsecheck
+```
+
+The one-argument shortcut `brew tap AcevedoR/pulsecheck` is the only form that
+would need a repository literally named `homebrew-pulsecheck`, since that form
+expands to `github.com/user/homebrew-repo` by assumption. Passing the URL makes
+no assumption.
 
 Or just take the file: it is one script with no dependency beyond `curl` and
 `awk`, both of which you already have.
